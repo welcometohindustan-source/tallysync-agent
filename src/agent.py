@@ -73,10 +73,21 @@ DEFAULT_CONFIG = {
 }
 
 def load_config():
-    cfg = configparser.ConfigParser()
+    # inline_comment_prefixes strips   key = value  ; comment  → value only
+    cfg = configparser.ConfigParser(inline_comment_prefixes=(';', '#'))
     cfg.read_dict(DEFAULT_CONFIG)
     if CONFIG_FILE.exists():
         cfg.read(CONFIG_FILE, encoding='utf-8')
+    # Extra safety: strip any leftover whitespace/comments from critical values
+    for key in ('tally_host', 'server_url', 'user_id', 'api_key', 'secret_key',
+                'interval_min', 'days_back', 'batch_months'):
+        if cfg.has_option('agent', key):
+            val = cfg.get('agent', key)
+            # Remove everything after first semicolon or hash that looks like a comment
+            val = val.split(';')[0].split('#')[0].strip()
+            # Remove embedded newlines (multi-line value continuation)
+            val = ' '.join(val.split())
+            cfg.set('agent', key, val)
     return cfg
 
 def save_default_config():
