@@ -348,6 +348,7 @@ def run_sync(cfg: configparser.ConfigParser) -> dict:
     except Exception as e:
         log.error(f'  Ledger fetch error: {e}')
         results['errors'].append('ledgers: ' + str(e))
+    time.sleep(4)   # wait before next request
 
     # ── 2. Stock items
     try:
@@ -367,6 +368,7 @@ def run_sync(cfg: configparser.ConfigParser) -> dict:
     except Exception as e:
         log.error(f'  Stock fetch error: {e}')
         results['errors'].append('stock: ' + str(e))
+    time.sleep(4)   # wait before next request
 
     # ── 3. Vouchers in monthly batches
     total_v = 0
@@ -407,11 +409,21 @@ def run_sync(cfg: configparser.ConfigParser) -> dict:
                 total_v += saved
                 log.info(f'    Saved: {saved}')
             else:
-                log.error(f'    Server error: {res.get("error")}')
-                results['errors'].append(f'vouchers {from_dt}: ' + str(res.get('error')))
+                err_msg = str(res.get('error', ''))
+                log.error(f'    Server error: {err_msg}')
+                # If server says PHP can't do GCM, auto-disable encryption
+                if 'PHP_NO_GCM' in err_msg:
+                    log.warning('    Server PHP does not support AES-GCM. '
+                                'Setting encrypt=false automatically.')
+                    encrypt_ = False
+                    secret   = ''
+                results['errors'].append(f'vouchers {from_dt}: ' + err_msg)
+            # Small delay between batches — prevents rate limit on server
+            time.sleep(4)
         except Exception as e:
             log.error(f'    Voucher batch error: {e}')
             results['errors'].append(f'vouchers {from_dt}: ' + str(e))
+            time.sleep(2)
 
     results['vouchers'] = total_v
     log.info(f'Sync done — Ledgers:{results["ledgers"]} '
