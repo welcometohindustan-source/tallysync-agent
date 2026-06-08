@@ -35,7 +35,7 @@ DEFAULTS = {
         'server_url': 'http://localhost/tallysync/api/ingest.php',
         'tally_host': 'http://localhost:9000',
         'interval_min': '5', 'days_back': '365',
-        'compress': 'true', 'encrypt': 'false',
+        'compress': 'true', 'encrypt': 'true',
     }
 }
 
@@ -112,6 +112,21 @@ def fetch_vouchers(host, fd, td):
 def compress_data(data: bytes) -> bytes:
     return gzip.compress(data, compresslevel=6)
 
+def derive_key(secret: str) -> bytes:
+    return hashlib.sha256(secret.encode('utf-8')).digest()
+
+def encrypt_aes_gcm(data: bytes, secret: str) -> bytes:
+    """AES-256-GCM encrypt. Returns: base64(12-byte nonce + ciphertext + 16-byte tag)."""
+    try:
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        key   = derive_key(secret)
+        nonce = os.urandom(12)
+        ct    = AESGCM(key).encrypt(nonce, data, None)
+        return base64.b64encode(nonce + ct)
+    except ImportError:
+        # cryptography lib not available — skip encryption
+        return base64.b64encode(data)
+
 def build_bundle(user_id, data_type, xml_body, meta=None):
     return json.dumps({
         'user_id': user_id, 'data_type': data_type,
@@ -122,10 +137,14 @@ def build_bundle(user_id, data_type, xml_body, meta=None):
     }, ensure_ascii=False).encode('utf-8')
 
 def send_bundle(server_url, user_id, api_key, bundle_bytes, compress_, encrypt_, secret):
-    payload = compress_data(bundle_bytes) if compress_ else bundle_bytes
+    payload  = compress_data(bundle_bytes) if compress_ else bundle_bytes
     cmp_flag = '1' if compress_ else '0'
-    enc_flag = '0'
-    payload  = base64.b64encode(payload)
+    if encrypt_ and secret:
+        payload  = encrypt_aes_gcm(payload, secret)
+        enc_flag = '1'
+    else:
+        payload  = base64.b64encode(payload)
+        enc_flag = '0'
 
     boundary = 'TSSyncBnd' + hashlib.md5(payload[:16]).hexdigest()[:8]
     fields   = {'uid': str(user_id), 'key': api_key,
@@ -528,7 +547,7 @@ class TallySyncApp:
                     self.log_append(f'  Error: {res.get("error")}', 'error')
             else:
                 self.log_append('No ledger data from Tally.', 'dim')
-            time.sleep(4)
+            time.sleep(1)
             if self.stop_flag: raise Exception('Stopped by user')
             self.root.after(0, lambda: self.set_progress(20, 'Ledgers done.'))
 
@@ -546,7 +565,7 @@ class TallySyncApp:
                     self.log_append(f'  Error: {res.get("error")}', 'error')
             else:
                 self.log_append('No stock data from Tally.', 'dim')
-            time.sleep(4)
+            time.sleep(1)
             if self.stop_flag: raise Exception('Stopped by user')
             self.root.after(0, lambda: self.set_progress(35, 'Stock done.'))
 
@@ -579,7 +598,7 @@ class TallySyncApp:
                 xml = fetch_vouchers(host, fd, td)
                 if '<VOUCHER' not in xml.upper():
                     self.log_append(f'  {fd}→{td}: no vouchers', 'dim')
-                    time.sleep(4)
+                    time.sleep(1)
                     continue
 
                 orig  = len(xml.encode('utf-8'))
@@ -598,7 +617,7 @@ class TallySyncApp:
                     self.log_append(f'  Saved: {saved}', 'ok')
                 else:
                     self.log_append(f'  Error: {res.get("error")}', 'error')
-                time.sleep(4)
+                time.sleep(1)
 
             self.root.after(0, lambda: self.set_progress(100, 'Sync complete ✓'))
             now = datetime.now().strftime('%d %b %Y, %H:%M')
