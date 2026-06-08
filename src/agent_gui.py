@@ -92,9 +92,18 @@ def fetch_ledgers(host):
          'LEDMAILINGDETAILS.LIST.PINCODE']), timeout=60)
 
 def fetch_stock(host):
-    return tally_post(host, collection_xml('TSStk','StockItem',
+    # Try standard StockItem collection
+    xml = collection_xml('TSStk', 'StockItem',
         ['GUID','ALTERID','NAME','PARENT','BASEUNITS',
-         'CLOSINGBALANCE','CLOSINGVALUE','RATE']), timeout=60)
+         'CLOSINGBALANCE','CLOSINGVALUE','OPENINGBALANCE',
+         'OPENINGVALUE','COSTPRICEPERLOT','STANDARDCOSTPRICE'])
+    result = tally_post(host, xml, timeout=60)
+    # If nothing returned, try alternate field names used in older TallyERP 9
+    if '<STOCKITEM' not in result.upper() and '<STOCKITEM' not in result:
+        xml2 = collection_xml('TSStk2', 'StockItem',
+            ['NAME','PARENT','BASEUNITS','CLOSINGBALANCE','CLOSINGVALUE'])
+        result = tally_post(host, xml2, timeout=60)
+    return result
 
 def fetch_vouchers(host, fd, td):
     return tally_post(host, collection_xml('TSVch','Voucher',
