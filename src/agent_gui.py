@@ -172,7 +172,7 @@ class TallySyncApp:
 
     def _build_ui(self):
         self.root.title('TallySync Mobile — Sync Agent')
-        self.root.geometry('620x700')
+        self.root.geometry('640x780')
         self.root.resizable(False, False)
         self.root.configure(bg='#f0f4f8')
         try: self.root.iconbitmap(default='')
@@ -227,6 +227,9 @@ class TallySyncApp:
                                    self._stop_sync, style='danger')
         self.btn_stop.pack(side='left', padx=(8,0))
         self.btn_stop.config(state='disabled')
+        self.btn_test = self._btn(btn_row, '🔍  Test Server',
+                                   self._test_server, style='light')
+        self.btn_test.pack(side='right')
 
         # ── Progress card
         self._card(content, '📊 Sync Progress', 1)
@@ -295,15 +298,30 @@ class TallySyncApp:
         # ── Log card
         self._card(content, '📝 Log', 3)
         log_body = self.log_card_body
-        self.log_text = tk.Text(log_body, height=8, font=('Consolas', 9),
+        log_scroll_frame = tk.Frame(log_body, bg='#0f1923')
+        log_scroll_frame.pack(fill='both', padx=1, pady=1)
+        scrollbar = tk.Scrollbar(log_scroll_frame, bg='#1d2939', troughcolor='#0f1923',
+                                  relief='flat', bd=0)
+        scrollbar.pack(side='right', fill='y')
+        self.log_text = tk.Text(log_scroll_frame, height=10, font=('Consolas', 9),
                                 bg='#0f1923', fg='#a8c4e0',
                                 relief='flat', bd=0, wrap='word',
-                                state='disabled')
-        self.log_text.pack(fill='x', padx=1, pady=1)
+                                state='disabled', yscrollcommand=scrollbar.set)
+        self.log_text.pack(side='left', fill='both', expand=True)
+        scrollbar.config(command=self.log_text.yview)
         self.log_text.tag_config('ok',    foreground='#4ade80')
         self.log_text.tag_config('error', foreground='#f87171')
         self.log_text.tag_config('info',  foreground='#93c5fd')
         self.log_text.tag_config('dim',   foreground='#6b7280')
+        self.log_text.tag_config('warn',  foreground='#fcd34d')
+        # Log toolbar
+        log_toolbar = tk.Frame(log_body, bg='white')
+        log_toolbar.pack(fill='x', padx=8, pady=(4,6))
+        self._btn(log_toolbar, '🗑  Clear log', self._clear_log, 'light').pack(side='left')
+        self._btn(log_toolbar, '📋  Copy log', self._copy_log, 'light').pack(side='left', padx=6)
+        self.lbl_log_count = tk.Label(log_toolbar, text='', bg='white',
+                                       fg='#9ca3af', font=('Segoe UI', 8))
+        self.lbl_log_count.pack(side='right')
 
         # ── Progress bar style
         style = ttk.Style()
@@ -373,6 +391,9 @@ class TallySyncApp:
         self.log_text.insert('end', f'{ts}  {msg}\n', tag)
         self.log_text.see('end')
         self.log_text.config(state='disabled')
+        # Update line count
+        lines = int(self.log_text.index('end-1c').split('.')[0])
+        self.lbl_log_count.config(text=f'{lines} lines')
         log.info(msg)
 
     # ── Progress helpers ──────────────────────────────────────────────────────
@@ -617,6 +638,84 @@ class TallySyncApp:
         m, s = divmod(remaining, 60)
         self.lbl_next_sync.config(text=f'Next auto-sync in {m:02d}:{s:02d}')
         self.root.after(1000, self._tick)
+
+
+    def _clear_log(self):
+        self.log_text.config(state='normal')
+        self.log_text.delete('1.0', 'end')
+        self.log_text.config(state='disabled')
+        self.lbl_log_count.config(text='')
+
+    def _copy_log(self):
+        content = self.log_text.get('1.0', 'end')
+        self.root.clipboard_clear()
+        self.root.clipboard_append(content)
+        self.lbl_log_count.config(text='✓ Copied to clipboard')
+        self.root.after(2000, lambda: self.lbl_log_count.config(text=''))
+
+    def _test_server(self):
+        threading.Thread(target=self._do_test_server, daemon=True).start()
+
+    def _do_test_server(self):
+        cfg = self.cfg['agent']
+        srv = cfg.get('server_url','').replace('/api/ingest.php','').replace('/ingest.php','')
+        srv = srv.rstrip('/')
+        uid = cfg.get('user_id','')
+        key = cfg.get('api_key','')
+        debug_url = srv + '/api/debug.php'
+        if uid and key:
+            debug_url += f'?uid={uid}&key={key}'
+        self.log_append(f'Testing server: {debug_url}', 'info')
+        try:
+            req = urllib.request.Request(debug_url, method='GET')
+            with urllib.request.urlopen(req, timeout=15) as r:
+                body = r.read().decode('utf-8', errors='replace')
+            try:
+                data = json.loads(body)
+                self.log_append(f'PHP version : {data.get("php_version","?")}', 'info')
+                self.log_append(f'DB connected: {data.get("db", False)}', 
+                                'ok' if data.get('db') else 'error')
+                if data.get('db_error'):
+                    self.log_append(f'DB error    : {data["db_error"]}', 'error')
+                # Extensions
+                exts = data.get('extensions', {})
+                missing = [k for k,v in exts.items() if not v]
+                if missing:
+                    self.log_append(f'Missing PHP extensions: {", ".join(missing)}', 'warn')
+                else:
+                    self.log_append('All required PHP extensions: OK', 'ok')
+                # AES-GCM
+                if not data.get('aes_gcm'):
+                    self.log_append('AES-GCM not supported on server — encrypt=false is correct', 'warn')
+                # Tables
+                tables = data.get('tables', {})
+                missing_tables = [t for t,v in tables.items() if not v]
+                if missing_tables:
+                    self.log_append(f'Missing DB tables: {", ".join(missing_tables)}', 'error')
+                else:
+                    self.log_append('All DB tables present: OK', 'ok')
+                # Auth
+                if uid and key:
+                    if data.get('auth'):
+                        u = data.get('user', {})
+                        self.log_append(
+                            f'Auth OK — User: {u.get("name")} | '
+                            f'Plan: {u.get("plan")} | Status: {u.get("status")}', 'ok')
+                    else:
+                        self.log_append(f'Auth FAILED: {data.get("auth_error")}', 'error')
+                # Warnings
+                for w in data.get('warnings', []):
+                    self.log_append(f'⚠ {w}', 'warn')
+                # Overall
+                if data.get('ok'):
+                    self.log_append('✓ Server ready — everything looks good!', 'ok')
+                else:
+                    self.log_append('✗ Server has issues — fix errors above then retry.', 'error')
+            except json.JSONDecodeError:
+                self.log_append(f'Server returned non-JSON: {body[:300]}', 'error')
+        except Exception as e:
+            self.log_append(f'Cannot reach server: {e}', 'error')
+            self.log_append(f'Check server_url in Settings. Is XAMPP Apache running?', 'warn')
 
 
 def main():
