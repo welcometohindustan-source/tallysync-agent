@@ -1,0 +1,115 @@
+# How to get TallySyncAgent.exe — No Python needed
+
+GitHub will compile the .exe for you in the cloud (free).
+Takes about 3 minutes. Follow these steps exactly.
+
+═══════════════════════════════════════════════════════════
+ STEP 1 — Create a free GitHub account (skip if you have one)
+═══════════════════════════════════════════════════════════
+
+1. Open https://github.com in your browser
+2. Click "Sign up" — enter email, password, username
+3. Verify your email
+
+
+═══════════════════════════════════════════════════════════
+ STEP 2 — Create a new repository
+═══════════════════════════════════════════════════════════
+
+1. After logging in, click the green "New" button (top left)
+2. Repository name: tallysync-agent
+3. Select: Private  (so your API keys are not public)
+4. Click "Create repository"
+
+
+═══════════════════════════════════════════════════════════
+ STEP 3 — Upload the agent files
+═══════════════════════════════════════════════════════════
+
+1. On your new empty repository page, click "uploading an existing file"
+2. You need to upload these files from TallySyncAgent_src.zip:
+
+   Folder structure to create on GitHub:
+   ┌─────────────────────────────────────────┐
+   │ tallysync-agent/                        │
+   │   .github/                              │
+   │     workflows/                          │
+   │       build.yml          ← upload this  │
+   │   src/                                  │
+   │     agent.py             ← upload this  │
+   │   config.ini             ← upload this  │
+   │   install.bat            ← upload this  │
+   │   uninstall.bat          ← upload this  │
+   └─────────────────────────────────────────┘
+
+   IMPORTANT: The .github/workflows/build.yml path must be exact.
+   GitHub needs the folder structure, so upload files one by one:
+
+   a. Drag "config.ini", "install.bat", "uninstall.bat" into the upload area
+   b. Click "Commit changes"
+
+   c. Now click "Add file" → "Create new file"
+   d. In the filename box type exactly:  .github/workflows/build.yml
+   e. Paste the contents of build.yml from the ZIP
+   f. Click "Commit new file"
+
+   g. Click "Add file" → "Create new file"
+   h. In the filename box type:  src/agent.py
+   i. Paste the contents of agent.py from the ZIP
+   j. Click "Commit new file"
+
+
+═══════════════════════════════════════════════════════════
+ STEP 4 — Run the build (GitHub Actions)
+═══════════════════════════════════════════════════════════
+
+1. Click the "Actions" tab at the top of your repository
+2. You should see "Build TallySyncAgent.exe" in the left list
+3. Click it, then click "Run workflow" (blue button on the right)
+4. Click the green "Run workflow" button in the popup
+5. Wait ~3 minutes — you'll see a spinning yellow circle
+
+   If the circle turns GREEN ✓ — build succeeded!
+   If it turns RED ✗ — click it to see the error log
+
+
+═══════════════════════════════════════════════════════════
+ STEP 5 — Download TallySyncAgent.exe
+═══════════════════════════════════════════════════════════
+
+1. Click on the completed workflow run (green checkmark)
+2. Scroll to the bottom — you'll see "Artifacts"
+3. Click "TallySyncAgent-Windows" to download a ZIP
+4. Extract the ZIP — you'll have:
+      TallySyncAgent.exe    ← the compiled agent
+      config.ini            ← edit this with your credentials
+      install.bat           ← run as Administrator to install
+      uninstall.bat
+
+
+═══════════════════════════════════════════════════════════
+ STEP 6 — Configure and install on your PC
+═══════════════════════════════════════════════════════════
+
+1. Copy all 4 files to a permanent folder, e.g.:
+      C:\TallySyncAgent\
+
+2. Open config.ini in Notepad
+3. Go to your TallySync portal → Sync page → copy the config block shown there
+4. Paste it into config.ini (replace the [agent] section)
+5. Save config.ini
+
+6. Right-click install.bat → "Run as Administrator"
+7. Done! Agent syncs every 5 minutes automatically.
+
+   Check tallysync_agent.log in C:\TallySyncAgent\ for sync status.
+
+
+═══════════════════════════════════════════════════════════
+ REBUILDING (if you change agent.py later)
+═══════════════════════════════════════════════════════════
+
+Just push any change to GitHub — the build runs automatically.
+Or go to Actions → Run workflow manually.
+
+The artifact is available for 30 days. Re-run anytime to refresh it.
