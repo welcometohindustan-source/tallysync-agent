@@ -65,7 +65,7 @@ DEFAULT_CONFIG = {
         'tally_host':     'http://localhost:9000',
         'interval_min':   '5',          # sync every N minutes
         'days_back':      '365',        # how many days of vouchers to pull
-        'encrypt':        'true',       # AES-256-GCM encryption
+        'encrypt':        'true',       # AES-256-GCM encryption (PHP 8.2+)
         'compress':       'true',       # gzip compression
         'secret_key':     '',           # 32-char AES key (set by admin portal)
         'batch_months':   '1',          # months per voucher request to Tally
@@ -198,25 +198,31 @@ def fetch_stock(host: str) -> str:
     return tally_post(host, xml)
 
 def fetch_vouchers(host: str, from_date: str, to_date: str) -> str:
-    """Fetch vouchers for a single date range (keep each request small)."""
-    xml = collection_xml(
-        'TSVouchers', 'Voucher',
-        [
-            'GUID','ALTERID','MASTERID','DATE','VOUCHERTYPENAME','VOUCHERNUMBER',
-            'PARTYLEDGERNAME','NARRATION',
-            'ALLLEDGERENTRIES.LIST.LEDGERNAME',
-            'ALLLEDGERENTRIES.LIST.AMOUNT',
-            'ALLLEDGERENTRIES.LIST.ISDEEMEDPOSITIVE',
-            'INVENTORYENTRIES.LIST.STOCKITEMNAME',
-            'INVENTORYENTRIES.LIST.ACTUALQTY',
-            'INVENTORYENTRIES.LIST.BILLEDQTY',
-            'INVENTORYENTRIES.LIST.RATE',
-            'INVENTORYENTRIES.LIST.AMOUNT',
-        ],
-        from_date=from_date,
-        to_date=to_date
+    """Fetch vouchers — try OBJECTTYPE first, fallback to Collection."""
+    fd = from_date; td = to_date
+    obj_xml = (
+        '<ENVELOPE>'
+        '<HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST>'
+        '<TYPE>Object</TYPE><SUBTYPE>Voucher</SUBTYPE></HEADER>'
+        '<BODY><DESC><STATICVARIABLES>'
+        '<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>'
+        f'<SVFROMDATE>{fd}</SVFROMDATE><SVTODATE>{td}</SVTODATE>'
+        '</STATICVARIABLES></DESC></BODY></ENVELOPE>'
     )
-    return tally_post(host, xml, timeout=90)
+    result = tally_post(host, obj_xml, timeout=120)
+    if '<VOUCHER' in result.upper():
+        return result
+    # Fallback to Collection
+    xml = collection_xml('TSVch','Voucher',
+        ['GUID','ALTERID','MASTERID','DATE','VOUCHERTYPENAME','VOUCHERNUMBER',
+         'PARTYLEDGERNAME','NARRATION',
+         'ALLLEDGERENTRIES.LIST.LEDGERNAME','ALLLEDGERENTRIES.LIST.AMOUNT',
+         'ALLLEDGERENTRIES.LIST.ISDEEMEDPOSITIVE',
+         'INVENTORYENTRIES.LIST.STOCKITEMNAME','INVENTORYENTRIES.LIST.ACTUALQTY',
+         'INVENTORYENTRIES.LIST.BILLEDQTY','INVENTORYENTRIES.LIST.RATE',
+         'INVENTORYENTRIES.LIST.AMOUNT'],
+        from_date=from_date, to_date=to_date)
+    return tally_post(host, xml, timeout=120)
 
 def fetch_companies(host: str) -> str:
     xml = collection_xml('TSCompanies', 'Company', ['NAME','GUID'])
@@ -348,7 +354,7 @@ def run_sync(cfg: configparser.ConfigParser) -> dict:
     except Exception as e:
         log.error(f'  Ledger fetch error: {e}')
         results['errors'].append('ledgers: ' + str(e))
-    time.sleep(4)   # wait before next request
+    time.sleep(1)   # wait before next request
 
     # ── 2. Stock items
     try:
@@ -368,7 +374,7 @@ def run_sync(cfg: configparser.ConfigParser) -> dict:
     except Exception as e:
         log.error(f'  Stock fetch error: {e}')
         results['errors'].append('stock: ' + str(e))
-    time.sleep(4)   # wait before next request
+    time.sleep(1)   # wait before next request
 
     # ── 3. Vouchers in monthly batches
     total_v = 0
@@ -419,11 +425,11 @@ def run_sync(cfg: configparser.ConfigParser) -> dict:
                     secret   = ''
                 results['errors'].append(f'vouchers {from_dt}: ' + err_msg)
             # Small delay between batches — prevents rate limit on server
-            time.sleep(4)
+            time.sleep(1)
         except Exception as e:
             log.error(f'    Voucher batch error: {e}')
             results['errors'].append(f'vouchers {from_dt}: ' + str(e))
-            time.sleep(2)
+            time.sleep(1)
 
     results['vouchers'] = total_v
     log.info(f'Sync done — Ledgers:{results["ledgers"]} '
