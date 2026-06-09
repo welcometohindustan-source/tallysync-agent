@@ -92,31 +92,43 @@ def fetch_ledgers(host):
          'LEDMAILINGDETAILS.LIST.PINCODE']), timeout=60)
 
 def fetch_stock(host):
-    # Try standard StockItem collection
-    xml = collection_xml('TSStk', 'StockItem',
-        ['GUID','ALTERID','NAME','PARENT','BASEUNITS',
-         'CLOSINGBALANCE','CLOSINGVALUE','OPENINGBALANCE',
-         'OPENINGVALUE','COSTPRICEPERLOT','STANDARDCOSTPRICE'])
-    result = tally_post(host, xml, timeout=60)
-    # If nothing returned, try alternate field names used in older TallyERP 9
-    if '<STOCKITEM' not in result.upper() and '<STOCKITEM' not in result:
-        xml2 = collection_xml('TSStk2', 'StockItem',
-            ['NAME','PARENT','BASEUNITS','CLOSINGBALANCE','CLOSINGVALUE'])
-        result = tally_post(host, xml2, timeout=60)
-    return result
+    xml = collection_xml('TSStk', 'StockItem', [
+        'GUID','ALTERID','NAME','PARENT','BASEUNITS',
+        'CLOSINGBALANCE','CLOSINGVALUE','RATE'
+    ])
+    return tally_post(host, xml, timeout=60)
 
 def fetch_vouchers(host, fd, td):
-    return tally_post(host, collection_xml('TSVch','Voucher',
-        ['GUID','ALTERID','MASTERID','DATE','VOUCHERTYPENAME',
-         'VOUCHERNUMBER','PARTYLEDGERNAME','NARRATION',
-         'ALLLEDGERENTRIES.LIST.LEDGERNAME',
-         'ALLLEDGERENTRIES.LIST.AMOUNT',
-         'ALLLEDGERENTRIES.LIST.ISDEEMEDPOSITIVE',
-         'INVENTORYENTRIES.LIST.STOCKITEMNAME',
-         'INVENTORYENTRIES.LIST.ACTUALQTY',
-         'INVENTORYENTRIES.LIST.RATE',
-         'INVENTORYENTRIES.LIST.AMOUNT',
-        ], fd=fd, td=td), timeout=90)
+    # Try OBJECTTYPE export first (returns complete voucher XML)
+    obj_xml = (
+        '<ENVELOPE>'
+        '<HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST>'
+        '<TYPE>Object</TYPE><SUBTYPE>Voucher</SUBTYPE></HEADER>'
+        '<BODY><DESC>'
+        '<STATICVARIABLES>'
+        '<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>'
+        f'<SVFROMDATE>{fd}</SVFROMDATE>'
+        f'<SVTODATE>{td}</SVTODATE>'
+        '</STATICVARIABLES>'
+        '</DESC></BODY></ENVELOPE>'
+    )
+    result = tally_post(host, obj_xml, timeout=120)
+    if '<VOUCHER' in result.upper():
+        return result
+    # Fallback to Collection export
+    coll_xml = collection_xml('TSVch', 'Voucher', [
+        'GUID','ALTERID','MASTERID','DATE','VOUCHERTYPENAME',
+        'VOUCHERNUMBER','PARTYLEDGERNAME','NARRATION',
+        'ALLLEDGERENTRIES.LIST.LEDGERNAME',
+        'ALLLEDGERENTRIES.LIST.AMOUNT',
+        'ALLLEDGERENTRIES.LIST.ISDEEMEDPOSITIVE',
+        'INVENTORYENTRIES.LIST.STOCKITEMNAME',
+        'INVENTORYENTRIES.LIST.ACTUALQTY',
+        'INVENTORYENTRIES.LIST.BILLEDQTY',
+        'INVENTORYENTRIES.LIST.RATE',
+        'INVENTORYENTRIES.LIST.AMOUNT',
+    ], fd=fd, td=td)
+    return tally_post(host, coll_xml, timeout=120)
 
 def compress_data(data: bytes) -> bytes:
     return gzip.compress(data, compresslevel=6)
@@ -556,7 +568,7 @@ class TallySyncApp:
                     self.log_append(f'  Error: {res.get("error")}', 'error')
             else:
                 self.log_append('No ledger data from Tally.', 'dim')
-            time.sleep(1)
+            time.sleep(1.1)
             if self.stop_flag: raise Exception('Stopped by user')
             self.root.after(0, lambda: self.set_progress(20, 'Ledgers done.'))
 
@@ -574,7 +586,7 @@ class TallySyncApp:
                     self.log_append(f'  Error: {res.get("error")}', 'error')
             else:
                 self.log_append('No stock data from Tally.', 'dim')
-            time.sleep(1)
+            time.sleep(1.1)
             if self.stop_flag: raise Exception('Stopped by user')
             self.root.after(0, lambda: self.set_progress(35, 'Stock done.'))
 
@@ -607,7 +619,7 @@ class TallySyncApp:
                 xml = fetch_vouchers(host, fd, td)
                 if '<VOUCHER' not in xml.upper():
                     self.log_append(f'  {fd}→{td}: no vouchers', 'dim')
-                    time.sleep(1)
+                    time.sleep(1.1)
                     continue
 
                 orig  = len(xml.encode('utf-8'))
@@ -626,7 +638,7 @@ class TallySyncApp:
                     self.log_append(f'  Saved: {saved}', 'ok')
                 else:
                     self.log_append(f'  Error: {res.get("error")}', 'error')
-                time.sleep(1)
+                time.sleep(1.1)
 
             self.root.after(0, lambda: self.set_progress(100, 'Sync complete ✓'))
             now = datetime.now().strftime('%d %b %Y, %H:%M')
