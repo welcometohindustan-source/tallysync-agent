@@ -1,0 +1,20 @@
+TallySync Mobile Agent - License Agreement
+==========================================
+
+This software is provided by TallySync Mobile for use by authorized
+customers only.
+
+1. You may install this software on any Windows PC where Tally ERP is
+   running under your licensed account.
+
+2. This software connects to your local Tally installation and syncs
+   data to your authorized TallySync server only.
+
+3. Your Tally data is encrypted with AES-256-GCM before transmission
+   and is stored securely on the server under your unique account.
+
+4. You may not reverse-engineer, redistribute or resell this software.
+
+5. Support: rajsys.mtr@gmail.com
+
+By clicking Install, you agree to these terms.
