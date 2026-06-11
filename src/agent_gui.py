@@ -16,18 +16,73 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, messagebox
 
-# ── Paths ─────────────────────────────────────────────────────────────────────
-EXE_DIR     = Path(sys.executable).parent if getattr(sys,'frozen',False) else Path(__file__).parent
-CONFIG_FILE = EXE_DIR / 'config.ini'
-LOG_FILE    = EXE_DIR / 'tallysync_agent.log'
+# ── Logo ──────────────────────────────────────────────────────────────────────
 
-# ── Logging ───────────────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s',
-    handlers=[logging.FileHandler(LOG_FILE, encoding='utf-8')]
-)
-log = logging.getLogger('TallySyncGUI')
+def load_logo_image(size=(32,32)):
+    """Load logo.png from EXE_DIR or APP_DIR. Returns PhotoImage or None."""
+    for path in [EXE_DIR / 'logo.png', APP_DIR / 'logo.png']:
+        if path.exists():
+            try:
+                from PIL import Image, ImageTk
+                img = Image.open(path).resize(size, Image.LANCZOS)
+                return ImageTk.PhotoImage(img)
+            except Exception:
+                pass
+    return None
+
+def set_window_icon(root):
+    """Set window icon from logo.ico or logo.png."""
+    for ext, name in [('.ico','logo'), ('.png','logo')]:
+        for d in [EXE_DIR, APP_DIR]:
+            p = d / (name + ext)
+            if p.exists():
+                try:
+                    if ext == '.ico':
+                        root.iconbitmap(str(p))
+                    else:
+                        from PIL import Image, ImageTk
+                        img = Image.open(p).resize((32,32), Image.LANCZOS)
+                        ico = ImageTk.PhotoImage(img)
+                        root.iconphoto(True, ico)
+                except Exception:
+                    pass
+                return
+
+# ── Paths ─────────────────────────────────────────────────────────────────────
+EXE_DIR = Path(sys.executable).parent if getattr(sys,'frozen',False) else Path(__file__).parent
+
+# Config and log go to AppData (writable) — not Program Files (read-only for users)
+def _appdata_dir():
+    # Windows: C:\Users\<user>\AppData\Roaming\TallySync
+    appdata = os.environ.get('APPDATA', '')
+    if appdata:
+        d = Path(appdata) / 'TallySync'
+    else:
+        # Fallback: same folder as exe (dev mode)
+        d = EXE_DIR
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+APP_DIR     = _appdata_dir()
+CONFIG_FILE = APP_DIR / 'config.ini'
+LOG_FILE    = APP_DIR / 'tallysync_agent.log'
+
+# ── Logging (set up after APP_DIR is resolved) ────────────────────────────────
+def _setup_logging():
+    logger = logging.getLogger('TallySyncGUI')
+    if logger.handlers:
+        return logger
+    logger.setLevel(logging.INFO)
+    fmt = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
+    try:
+        fh = logging.FileHandler(LOG_FILE, encoding='utf-8')
+        fh.setFormatter(fmt)
+        logger.addHandler(fh)
+    except Exception:
+        pass  # Can't write log — non-fatal
+    return logger
+
+log = _setup_logging()
 
 # ── Config ────────────────────────────────────────────────────────────────────
 DEFAULTS = {'agent': {
@@ -214,8 +269,10 @@ class TallySyncApp:
         self.cfg       = load_cfg()
         self.syncing   = False
         self.stop_flag = False
+        self.paused    = False
         self.companies = []
         self._next_sync = time.time() + self._interval_secs()
+        self._settings_win = None
         self._build_ui()
         self.root.after(500, self._auto_connect)
         self._tick()
@@ -228,16 +285,25 @@ class TallySyncApp:
 
     def _build_ui(self):
         self.root.title('TallySync Mobile — Sync Agent')
-        self.root.geometry('600x660')
+        self.root.geometry('600x700')
         self.root.resizable(False, False)
         self.root.configure(bg='#f0f4f8')
         self.root.protocol('WM_DELETE_WINDOW', self._on_close)
+        set_window_icon(self.root)
 
-        # Header
+        # Header — show logo if available
         hdr = tk.Frame(self.root, bg='#0f1923', height=60)
         hdr.pack(fill='x'); hdr.pack_propagate(False)
-        tk.Label(hdr, text='⚡  TallySync Mobile', bg='#0f1923', fg='white',
-                 font=('Segoe UI',16,'bold')).pack(side='left', padx=18, pady=12)
+
+        # Try to load logo image for header
+        self._logo_img = load_logo_image(size=(36,36))
+        if self._logo_img:
+            tk.Label(hdr, image=self._logo_img, bg='#0f1923').pack(side='left', padx=(14,6), pady=10)
+            tk.Label(hdr, text='TallySync Mobile', bg='#0f1923', fg='white',
+                     font=('Segoe UI',16,'bold')).pack(side='left', pady=12)
+        else:
+            tk.Label(hdr, text='⚡  TallySync Mobile', bg='#0f1923', fg='white',
+                     font=('Segoe UI',16,'bold')).pack(side='left', padx=18, pady=12)
         tk.Label(hdr, text='Agent v4.0', bg='#0f1923', fg='#6b8cae',
                  font=('Segoe UI',10)).pack(side='right', padx=18)
 
@@ -269,13 +335,31 @@ class TallySyncApp:
         btn_row.pack(fill='x', padx=10, pady=(4,10))
         self.btn_connect  = self._btn(btn_row,'🔌  Connect', self._connect,  'light')
         self.btn_connect.pack(side='left', padx=(0,6))
-        self.btn_sync_all = self._btn(btn_row,'▶  Sync All Now', self._sync_all, 'primary')
+        self.btn_sync_all = self._btn(btn_row,'▶  Sync Now', self._sync_all, 'primary')
         self.btn_sync_all.pack(side='left')
         self.btn_stop     = self._btn(btn_row,'⏹  Stop', self._stop, 'danger')
         self.btn_stop.pack(side='left', padx=(6,0))
         self.btn_stop.config(state='disabled')
-        self.btn_test     = self._btn(btn_row,'🔍  Test Server', self._test_server, 'light')
+        self.btn_pause    = self._btn(btn_row,'⏸  Pause', self._toggle_pause, 'light')
+        self.btn_pause.pack(side='left', padx=(6,0))
+        self.btn_settings = self._btn(btn_row,'⚙  Settings', self._open_settings, 'light')
+        self.btn_settings.pack(side='right', padx=(6,0))
+        self.btn_test     = self._btn(btn_row,'🔍  Test', self._test_server, 'light')
         self.btn_test.pack(side='right')
+
+        # Interval selector row
+        irow = tk.Frame(self.company_body, bg='white')
+        irow.pack(fill='x', padx=10, pady=(0,8))
+        tk.Label(irow, text='Auto-sync interval:', bg='white', fg='#6b7280',
+                 font=('Segoe UI',9)).pack(side='left', padx=(0,6))
+        self.interval_var = tk.StringVar(value=self.cfg['agent'].get('interval_min','5'))
+        interval_cb = ttk.Combobox(irow, textvariable=self.interval_var,
+                                    values=['5','10','20','30','45','60'],
+                                    width=5, state='readonly', font=('Segoe UI',9))
+        interval_cb.pack(side='left')
+        interval_cb.bind('<<ComboboxSelected>>', self._on_interval_change)
+        tk.Label(irow, text='minutes', bg='white', fg='#6b7280',
+                 font=('Segoe UI',9)).pack(side='left', padx=(4,0))
 
         # ── Progress card
         self._card(content, '📊  Sync Progress', 'progress')
@@ -352,6 +436,10 @@ class TallySyncApp:
     # ── COUNTDOWN ────────────────────────────────────────────────────────────
 
     def _tick(self):
+        if self.paused:
+            self.lbl_next.config(text='Auto-sync paused ⏸')
+            self.root.after(1000, self._tick)
+            return
         rem = int(self._next_sync - time.time())
         if rem <= 0:
             if not self.syncing:
@@ -361,6 +449,112 @@ class TallySyncApp:
         m,s = divmod(rem,60)
         self.lbl_next.config(text=f'Next auto-sync in {m:02d}:{s:02d}')
         self.root.after(1000, self._tick)
+
+    def _toggle_pause(self):
+        self.paused = not self.paused
+        if self.paused:
+            self.btn_pause.config(text='▶  Resume')
+            self.log_append('Auto-sync paused. Click Resume to restart.', 'warn')
+        else:
+            self.paused = False
+            self._next_sync = time.time() + self._interval_secs()
+            self.btn_pause.config(text='⏸  Pause')
+            self.log_append('Auto-sync resumed.', 'ok')
+
+    def _on_interval_change(self, event=None):
+        val = self.interval_var.get().strip()
+        try:
+            mins = int(val)
+            self.cfg['agent']['interval_min'] = str(mins)
+            save_cfg(self.cfg)
+            self._next_sync = time.time() + self._interval_secs()
+            self.log_append(f'Sync interval set to {mins} minutes.', 'ok')
+        except ValueError:
+            pass
+
+    # ── SETTINGS WINDOW ──────────────────────────────────────────────────────
+
+    def _open_settings(self):
+        if self._settings_win and tk.Toplevel.winfo_exists(self._settings_win):
+            self._settings_win.lift()
+            return
+        win = tk.Toplevel(self.root)
+        win.title('TallySync — Settings')
+        win.geometry('440x420')
+        win.resizable(False, False)
+        win.configure(bg='#f0f4f8')
+        win.grab_set()
+        self._settings_win = win
+
+        # Header
+        hdr = tk.Frame(win, bg='#0f1923', height=48)
+        hdr.pack(fill='x'); hdr.pack_propagate(False)
+        tk.Label(hdr, text='⚙  Agent Settings', bg='#0f1923', fg='white',
+                 font=('Segoe UI',13,'bold')).pack(side='left', padx=14, pady=10)
+
+        body = tk.Frame(win, bg='#f0f4f8', padx=16, pady=12)
+        body.pack(fill='both', expand=True)
+
+        tk.Label(body,
+            text='These credentials are provided by your TallySync administrator. Do not share them with anyone.',
+            bg='#f0f4f8', fg='#6b7280', font=('Segoe UI',9), wraplength=380,
+            justify='left').pack(anchor='w', pady=(0,10))
+
+        fields = [
+            ('User ID',       'user_id',     ''),
+            ('API Key',       'api_key',     ''),
+            ('Secret Key',    'secret_key',  ''),
+            ('Tally URL',     'tally_host',  'http://localhost:9000'),
+            ('Server URL',    'server_url',  'http://localhost/tallysync/api/ingest.php'),
+        ]
+        svars = {}
+        for label, key, placeholder in fields:
+            row = tk.Frame(body, bg='#f0f4f8')
+            row.pack(fill='x', pady=3)
+            tk.Label(row, text=label, bg='#f0f4f8', fg='#374151',
+                     font=('Segoe UI',9,'bold'), width=12, anchor='e').pack(side='left', padx=(0,8))
+            var = tk.StringVar(value=self.cfg['agent'].get(key,''))
+            show = '*' if key in ('api_key','secret_key') else ''
+            ent = tk.Entry(row, textvariable=var, font=('Segoe UI',10),
+                           show=show, bg='white', relief='flat', bd=1,
+                           highlightthickness=1, highlightbackground='#d1d5db',
+                           highlightcolor='#1464f4')
+            ent.pack(side='left', fill='x', expand=True)
+            svars[key] = var
+
+        def save_settings():
+            for key, var in svars.items():
+                val = var.get().strip()
+                if val:
+                    self.cfg['agent'][key] = val
+            save_cfg(self.cfg)
+            self.cfg = load_cfg()
+            lbl_ok.config(text='✓ Saved successfully')
+            win.after(2000, lambda: lbl_ok.config(text=''))
+            self.log_append('Settings saved.', 'ok')
+
+        def toggle_show():
+            for key in ('api_key','secret_key'):
+                pass  # toggle visibility if needed
+
+        save_btn_row = tk.Frame(body, bg='#f0f4f8')
+        save_btn_row.pack(fill='x', pady=(12,0))
+        tk.Button(save_btn_row, text='💾  Save Settings',
+                  bg='#1464f4', fg='white', font=('Segoe UI',10,'bold'),
+                  relief='flat', cursor='hand2', padx=14, pady=8, bd=0,
+                  command=save_settings).pack(side='left')
+        tk.Button(save_btn_row, text='Close',
+                  bg='#f3f4f6', fg='#374151', font=('Segoe UI',10),
+                  relief='flat', cursor='hand2', padx=14, pady=8, bd=0,
+                  command=win.destroy).pack(side='left', padx=(8,0))
+        lbl_ok = tk.Label(body, text='', bg='#f0f4f8', fg='#0e9f6e',
+                          font=('Segoe UI',9))
+        lbl_ok.pack(anchor='w', pady=(6,0))
+
+        tk.Label(body,
+            text='Log file: ' + str(LOG_FILE),
+            bg='#f0f4f8', fg='#9ca3af', font=('Consolas',8),
+            wraplength=380, justify='left').pack(anchor='w', pady=(12,0))
 
     # ── CONNECT ───────────────────────────────────────────────────────────────
 
@@ -576,9 +770,10 @@ class SetupWindow:
     def __init__(self, root):
         self.root = root
         root.title('TallySync — First Time Setup')
-        root.geometry('480x400')
+        root.geometry('480x430')
         root.resizable(False, False)
         root.configure(bg='#0f1923')
+        set_window_icon(root)
 
         tk.Label(root, text='⚡ TallySync Mobile', bg='#0f1923', fg='white',
                  font=('Segoe UI',18,'bold')).pack(pady=(28,4))
