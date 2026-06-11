@@ -17,36 +17,53 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 
 # ── Logo ──────────────────────────────────────────────────────────────────────
+# Logo is embedded at build time — place logo.png in src/ folder before building
+# GitHub Actions copies it into the exe via PyInstaller --add-data
 
-def load_logo_image(size=(32,32)):
-    """Load logo.png from EXE_DIR or APP_DIR. Returns PhotoImage or None."""
-    for path in [EXE_DIR / 'logo.png', APP_DIR / 'logo.png']:
-        if path.exists():
-            try:
-                from PIL import Image, ImageTk
-                img = Image.open(path).resize(size, Image.LANCZOS)
-                return ImageTk.PhotoImage(img)
-            except Exception:
-                pass
+def _get_logo_path(filename):
+    """Find logo file — works both in dev and PyInstaller frozen exe."""
+    # PyInstaller extracts data files to sys._MEIPASS
+    if getattr(sys, '_MEIPASS', None):
+        p = Path(sys._MEIPASS) / filename
+        if p.exists(): return p
+    # Dev mode — check src/ folder and EXE_DIR
+    for d in [Path(__file__).parent, EXE_DIR]:
+        p = d / filename
+        if p.exists(): return p
+    return None
+
+def load_logo_image(size=(36,36)):
+    """Load embedded logo. Returns PhotoImage or None."""
+    p = _get_logo_path('logo.png')
+    if p:
+        try:
+            from PIL import Image, ImageTk
+            img = Image.open(p).resize(size, Image.LANCZOS)
+            return ImageTk.PhotoImage(img)
+        except Exception:
+            pass
     return None
 
 def set_window_icon(root):
-    """Set window icon from logo.ico or logo.png."""
-    for ext, name in [('.ico','logo'), ('.png','logo')]:
-        for d in [EXE_DIR, APP_DIR]:
-            p = d / (name + ext)
-            if p.exists():
-                try:
-                    if ext == '.ico':
-                        root.iconbitmap(str(p))
-                    else:
-                        from PIL import Image, ImageTk
-                        img = Image.open(p).resize((32,32), Image.LANCZOS)
-                        ico = ImageTk.PhotoImage(img)
-                        root.iconphoto(True, ico)
-                except Exception:
-                    pass
-                return
+    """Set window taskbar + tray icon from embedded logo.ico or logo.png."""
+    # Try .ico first (best quality on Windows)
+    p = _get_logo_path('logo.ico')
+    if p:
+        try:
+            root.iconbitmap(str(p))
+            return
+        except Exception:
+            pass
+    # Fallback to .png
+    p = _get_logo_path('logo.png')
+    if p:
+        try:
+            from PIL import Image, ImageTk
+            img = Image.open(p).resize((32,32), Image.LANCZOS)
+            ico = ImageTk.PhotoImage(img)
+            root.iconphoto(True, ico)
+        except Exception:
+            pass
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 EXE_DIR = Path(sys.executable).parent if getattr(sys,'frozen',False) else Path(__file__).parent
@@ -96,7 +113,7 @@ def load_cfg():
     cfg = configparser.ConfigParser(inline_comment_prefixes=(';','#'))
     cfg.read_dict(DEFAULTS)
     if CONFIG_FILE.exists():
-        cfg.read(CONFIG_FILE, encoding='utf-8')
+        cfg.read(str(CONFIG_FILE), encoding='utf-8')
     for k in ('tally_host','server_url','user_id','api_key','secret_key','interval_min'):
         if cfg.has_option('agent', k):
             v = cfg.get('agent', k).split(';')[0].split('#')[0].strip()
@@ -109,8 +126,12 @@ def save_cfg(cfg):
 
 def is_configured():
     cfg = load_cfg()
-    a = cfg['agent']
-    return bool(a.get('user_id') and a.get('api_key') and a.get('server_url'))
+    if not cfg.has_section('agent'):
+        return False
+    uid = cfg.get('agent','user_id').strip() if cfg.has_option('agent','user_id') else ''
+    key = cfg.get('agent','api_key').strip() if cfg.has_option('agent','api_key') else ''
+    srv = cfg.get('agent','server_url').strip() if cfg.has_option('agent','server_url') else ''
+    return bool(uid and key and srv)
 
 # ── Network helpers ───────────────────────────────────────────────────────────
 
@@ -278,8 +299,11 @@ class TallySyncApp:
         self._tick()
 
     def _interval_secs(self):
-        try:    return max(60, int(self.cfg['agent'].get('interval_min','5')) * 60)
-        except: return 300
+        try:
+            val = self.cfg.get('agent','interval_min') if self.cfg.has_option('agent','interval_min') else '5'
+            return max(60, int(val) * 60)
+        except Exception:
+            return 300
 
     # ── BUILD UI ─────────────────────────────────────────────────────────────
 
@@ -352,7 +376,8 @@ class TallySyncApp:
         irow.pack(fill='x', padx=10, pady=(0,8))
         tk.Label(irow, text='Auto-sync interval:', bg='white', fg='#6b7280',
                  font=('Segoe UI',9)).pack(side='left', padx=(0,6))
-        self.interval_var = tk.StringVar(value=self.cfg['agent'].get('interval_min','5'))
+        _iv = self.cfg.get('agent','interval_min').strip() if self.cfg.has_option('agent','interval_min') else '5'
+        self.interval_var = tk.StringVar(value=_iv)
         interval_cb = ttk.Combobox(irow, textvariable=self.interval_var,
                                     values=['5','10','20','30','45','60'],
                                     width=5, state='readonly', font=('Segoe UI',9))
@@ -465,10 +490,12 @@ class TallySyncApp:
         val = self.interval_var.get().strip()
         try:
             mins = int(val)
-            self.cfg['agent']['interval_min'] = str(mins)
+            if not self.cfg.has_section('agent'):
+                self.cfg.add_section('agent')
+            self.cfg.set('agent', 'interval_min', str(mins))
             save_cfg(self.cfg)
             self._next_sync = time.time() + self._interval_secs()
-            self.log_append(f'Sync interval set to {mins} minutes.', 'ok')
+            self.log_append('Sync interval set to ' + str(mins) + ' minutes.', 'ok')
         except ValueError:
             pass
 
@@ -513,7 +540,8 @@ class TallySyncApp:
             row.pack(fill='x', pady=3)
             tk.Label(row, text=label, bg='#f0f4f8', fg='#374151',
                      font=('Segoe UI',9,'bold'), width=12, anchor='e').pack(side='left', padx=(0,8))
-            var = tk.StringVar(value=self.cfg['agent'].get(key,''))
+            cur = self.cfg.get('agent',key).strip() if self.cfg.has_option('agent',key) else ''
+            var = tk.StringVar(value=cur)
             show = '*' if key in ('api_key','secret_key') else ''
             ent = tk.Entry(row, textvariable=var, font=('Segoe UI',10),
                            show=show, bg='white', relief='flat', bd=1,
@@ -523,13 +551,15 @@ class TallySyncApp:
             svars[key] = var
 
         def save_settings():
+            if not self.cfg.has_section('agent'):
+                self.cfg.add_section('agent')
             for key, var in svars.items():
                 val = var.get().strip()
                 if val:
-                    self.cfg['agent'][key] = val
+                    self.cfg.set('agent', key, val)
             save_cfg(self.cfg)
             self.cfg = load_cfg()
-            lbl_ok.config(text='✓ Saved successfully')
+            lbl_ok.config(text='Saved successfully')
             win.after(2000, lambda: lbl_ok.config(text=''))
             self.log_append('Settings saved.', 'ok')
 
@@ -616,14 +646,15 @@ class TallySyncApp:
         self.root.after(0,lambda:self.btn_stop.config(state='normal'))
         self._progress(0,'Starting sync…')
 
-        a   = self.cfg['agent']
-        host= a.get('tally_host','http://localhost:9000')
-        srv = a.get('server_url','')
-        uid = a.get('user_id','')
-        key = a.get('api_key','')
-        sec = a.get('secret_key','')
-        cmp_= a.get('compress','true').lower()=='true'
-        enc_= a.get('encrypt','true').lower()=='true'
+        def _gcfg(k, default=''):
+            return self.cfg.get('agent', k).strip() if self.cfg.has_option('agent', k) else default
+        host = _gcfg('tally_host','http://localhost:9000')
+        srv  = _gcfg('server_url','')
+        uid  = _gcfg('user_id','')
+        key  = _gcfg('api_key','')
+        sec  = _gcfg('secret_key','')
+        cmp_ = _gcfg('compress','true').lower() == 'true'
+        enc_ = _gcfg('encrypt','true').lower() == 'true'
 
         if not uid or not srv:
             self.log_append('ERROR: Agent not configured. Contact your TallySync admin.','error')
@@ -805,16 +836,25 @@ class SetupWindow:
             cfg = configparser.ConfigParser(inline_comment_prefixes=(';','#'))
             cfg.read_string(raw)
             if not cfg.has_section('agent'):
-                self.lbl_err.config(text='Must start with [agent]'); return
-            if not cfg.get('agent','user_id','').strip():
-                self.lbl_err.config(text='user_id is empty'); return
-            if not cfg.get('agent','api_key','').strip():
-                self.lbl_err.config(text='api_key is empty'); return
-            with open(CONFIG_FILE,'w') as f: cfg.write(f)
+                self.lbl_err.config(text='Error: config must start with [agent]')
+                return
+            # Use has_option + get (no fallback arg) for compatibility
+            uid = cfg.get('agent','user_id').strip() if cfg.has_option('agent','user_id') else ''
+            key = cfg.get('agent','api_key').strip() if cfg.has_option('agent','api_key') else ''
+            srv = cfg.get('agent','server_url').strip() if cfg.has_option('agent','server_url') else ''
+            if not uid:
+                self.lbl_err.config(text='Error: user_id is empty'); return
+            if not key:
+                self.lbl_err.config(text='Error: api_key is empty'); return
+            if not srv:
+                self.lbl_err.config(text='Error: server_url is empty'); return
+            # Save to AppData config file
+            with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+                cfg.write(f)
             self.root.destroy()
             launch_main()
         except Exception as e:
-            self.lbl_err.config(text=str(e)[:80])
+            self.lbl_err.config(text=str(e)[:90])
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
@@ -848,12 +888,16 @@ def run_tray(app_root):
 
 
 def run_once_headless():
-    cfg  = load_cfg(); a = cfg["agent"]
-    host = a.get("tally_host","http://localhost:9000")
-    srv  = a.get("server_url",""); uid = a.get("user_id","")
-    key  = a.get("api_key","");    sec = a.get("secret_key","")
-    cmp_ = a.get("compress","true").lower()=="true"
-    enc_ = a.get("encrypt","true").lower()=="true"
+    cfg = load_cfg()
+    def _g(k, d=''):
+        return cfg.get('agent', k).strip() if cfg.has_option('agent', k) else d
+    host = _g('tally_host','http://localhost:9000')
+    srv  = _g('server_url','')
+    uid  = _g('user_id','')
+    key  = _g('api_key','')
+    sec  = _g('secret_key','')
+    cmp_ = _g('compress','true').lower() == 'true'
+    enc_ = _g('encrypt','true').lower() == 'true'
     if not uid or not srv:
         log.error("Agent not configured."); return
     log.info("=== Headless sync started ===")
