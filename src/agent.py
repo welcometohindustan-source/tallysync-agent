@@ -193,7 +193,7 @@ def fetch_stock(host: str) -> str:
     log.info('Fetching stock items from Tally...')
     xml = collection_xml(
         'TSStock', 'StockItem',
-        ['GUID','ALTERID','NAME','PARENT','BASEUNITS','CLOSINGBALANCE','CLOSINGVALUE','RATE']
+        ['GUID','ALTERID','NAME','PARENT','BASEUNITS','CLOSINGBALANCE','CLOSINGVALUE','RATE','OPENINGBALANCE','OPENINGVALUE']
     )
     return tally_post(host, xml)
 
