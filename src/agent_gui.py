@@ -10,7 +10,7 @@ TallySync Mobile — Desktop Sync Agent  v4
 
 import os, sys, time, gzip, json, base64, hashlib, logging
 import configparser, urllib.request, urllib.error, threading, traceback
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import tkinter as tk
@@ -107,6 +107,7 @@ DEFAULTS = {'agent': {
     'server_url': 'http://localhost/tallysync/api/ingest.php',
     'tally_host': 'http://localhost:9000',
     'interval_min': '5', 'compress': 'true', 'encrypt': 'true',
+    'last_voucher_sync_date': '', 'incremental_overlap_days': '7',
 }}
 
 def load_cfg():
@@ -170,15 +171,27 @@ def fetch_stock(host):
         ['GUID','ALTERID','NAME','PARENT','BASEUNITS',
          'CLOSINGBALANCE','CLOSINGVALUE','RATE']), timeout=60)
 
-def fetch_all_vouchers(host):
-    """Single request for ALL vouchers — no date range filter."""
-    # Try full company export first (fastest)
+def fetch_all_vouchers(host, from_date=None, to_date=None):
+    """Fetch vouchers from Tally.
+
+    If from_date is given (YYYYMMDD), restricts the export to that date range
+    via SVFROMDATE/SVTODATE — used for incremental syncs. With no date range,
+    pulls ALL vouchers (first-ever sync).
+    """
+    date_vars = ''
+    if from_date:
+        to_d = to_date or datetime.now().strftime('%Y%m%d')
+        date_vars = (
+            f'<SVFROMDATE>{from_date}</SVFROMDATE>'
+            f'<SVTODATE>{to_d}</SVTODATE>'
+        )
     obj_xml = (
         '<ENVELOPE><HEADER><VERSION>1</VERSION>'
         '<TALLYREQUEST>Export</TALLYREQUEST>'
         '<TYPE>Collection</TYPE><ID>TSAllVch</ID></HEADER>'
         '<BODY><DESC><STATICVARIABLES>'
         '<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>'
+        f'{date_vars}'
         '</STATICVARIABLES>'
         '<TDL><TDLMESSAGE>'
         '<COLLECTION NAME="TSAllVch" ISMODIFY="No">'
@@ -697,28 +710,54 @@ class TallySyncApp:
             time.sleep(1.1)
             self._progress(35,'Stock done.')
 
-            # ── 3. Vouchers — SINGLE REQUEST for all vouchers
-            self._progress(40,'Fetching ALL vouchers from Tally (single request)…')
-            self.log_append('Requesting all vouchers from Tally…','info')
-            xml = fetch_all_vouchers(host)
+            # ── 3. Vouchers — incremental (date-filtered) after first sync
+            last_sync_date = _gcfg('last_voucher_sync_date','').strip()
+            overlap_days   = int(_gcfg('incremental_overlap_days','7') or '7')
+            today_str = datetime.now().strftime('%Y%m%d')
+
+            if last_sync_date:
+                try:
+                    resume_dt = datetime.strptime(last_sync_date,'%Y%m%d') - timedelta(days=overlap_days)
+                    from_date = resume_dt.strftime('%Y%m%d')
+                except ValueError:
+                    from_date = None
+                is_first = '0'
+                self._progress(40, f'Fetching vouchers since {from_date} (incremental)...')
+                self.log_append(f'Incremental sync: fetching vouchers from {from_date} to {today_str} '
+                                 f'({overlap_days}-day overlap)','info')
+            else:
+                from_date = None
+                is_first  = '1'
+                self._progress(40,'Fetching ALL vouchers from Tally (first sync)...')
+                self.log_append('First sync: requesting full voucher history...','info')
+
+            xml = fetch_all_vouchers(host, from_date=from_date, to_date=today_str if from_date else None)
             vch_count = xml.upper().count('<VOUCHER')
             self.log_append(f'Vouchers: {len(xml):,} bytes, ~{vch_count} vouchers found','dim')
 
             if '<VOUCHER' in xml.upper():
-                self._progress(60,'Compressing & sending vouchers to server…')
+                self._progress(60,'Compressing & sending vouchers to server...')
                 bundle = build_bundle(uid,'vouchers',xml,
-                                      meta={'from_date':'','to_date':''})
+                                      meta={'from_date':from_date or '','to_date':today_str if from_date else ''})
                 orig   = len(bundle)
                 res    = send_bundle(srv,uid,key,bundle,cmp_,enc_,sec,
-                                     extra={'is_first':'1'})
+                                     extra={'is_first':is_first})
                 saved  = res.get('saved',0) if res.get('ok') else 0
                 fetched= res.get('fetched',0)
                 self.root.after(0,lambda s=saved:self.stat_vars['vouchers'].set(str(s)))
-                self.log_append(f'Vouchers — fetched:{fetched} saved:{saved}',
+                self.log_append(f'Vouchers - fetched:{fetched} saved:{saved}',
                                 'ok' if res.get('ok') else 'error')
-                if res.get('error'): self.log_append(f'  └ {res.get("error")}','warn')
+                if res.get('error'): self.log_append(f'  -> {res.get("error")}','warn')
+                if res.get('ok'):
+                    if not self.cfg.has_section('agent'): self.cfg.add_section('agent')
+                    self.cfg.set('agent','last_voucher_sync_date', today_str)
+                    save_cfg(self.cfg)
             else:
-                self.log_append('No vouchers returned from Tally','warn')
+                self.log_append('No vouchers returned from Tally (or none in range)','warn')
+                if from_date:
+                    if not self.cfg.has_section('agent'): self.cfg.add_section('agent')
+                    self.cfg.set('agent','last_voucher_sync_date', today_str)
+                    save_cfg(self.cfg)
 
             self._progress(100,'Sync complete ✓')
             now = datetime.now().strftime('%d %b %Y, %H:%M')
@@ -912,12 +951,31 @@ def run_once_headless():
             res = send_bundle(srv,uid,key,build_bundle(uid,"stock",xml),cmp_,enc_,sec)
             log.info(f"Stock: {res}")
         time.sleep(1.1)
-        xml = fetch_all_vouchers(host)
+        last_sync_date = _g('last_voucher_sync_date','').strip()
+        overlap_days   = int(_g('incremental_overlap_days','7') or '7')
+        today_str = datetime.now().strftime('%Y%m%d')
+        from_date = None
+        is_first  = '1'
+        if last_sync_date:
+            try:
+                from_date = (datetime.strptime(last_sync_date,'%Y%m%d') - timedelta(days=overlap_days)).strftime('%Y%m%d')
+                is_first  = '0'
+            except ValueError:
+                pass
+        xml = fetch_all_vouchers(host, from_date=from_date, to_date=today_str if from_date else None)
         if "<VOUCHER" in xml.upper():
             res = send_bundle(srv,uid,key,
-                    build_bundle(uid,"vouchers",xml,meta={"from_date":"","to_date":""}),
-                    cmp_,enc_,sec,extra={"is_first":"1"})
+                    build_bundle(uid,"vouchers",xml,meta={"from_date":from_date or "","to_date":today_str if from_date else ""}),
+                    cmp_,enc_,sec,extra={"is_first":is_first})
             log.info(f"Vouchers: {res}")
+            if res.get('ok'):
+                if not cfg.has_section('agent'): cfg.add_section('agent')
+                cfg.set('agent','last_voucher_sync_date', today_str)
+                save_cfg(cfg)
+        elif from_date:
+            if not cfg.has_section('agent'): cfg.add_section('agent')
+            cfg.set('agent','last_voucher_sync_date', today_str)
+            save_cfg(cfg)
         log.info("=== Headless sync complete ===")
     except Exception as e:
         log.error(f"Headless sync error: {e}")
