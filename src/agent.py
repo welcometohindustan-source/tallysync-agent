@@ -69,6 +69,8 @@ DEFAULT_CONFIG = {
         'compress':       'true',       # gzip compression
         'secret_key':     '',           # 32-char AES key (set by admin portal)
         'batch_months':   '1',          # months per voucher request to Tally
+        'last_voucher_sync_date': '',   # internal: tracks incremental sync progress (YYYYMMDD)
+        'incremental_overlap_days': '7', # re-fetch this many days before last sync, to catch backdated edits
     }
 }
 
@@ -97,6 +99,20 @@ def save_default_config():
         with open(CONFIG_FILE, 'w') as f:
             cfg.write(f)
         log.info(f'Default config written to {CONFIG_FILE}')
+
+def save_config_value(key: str, value: str):
+    """Persist a single value into config.ini, preserving the rest of the file."""
+    try:
+        cfg = configparser.ConfigParser(inline_comment_prefixes=(';', '#'))
+        if CONFIG_FILE.exists():
+            cfg.read(CONFIG_FILE, encoding='utf-8')
+        if not cfg.has_section('agent'):
+            cfg.add_section('agent')
+        cfg.set('agent', key, value)
+        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+            cfg.write(f)
+    except Exception as e:
+        log.warning(f'Could not persist config value {key}={value}: {e}')
 
 # ── encryption / compression ──────────────────────────────────────────────────
 
@@ -379,7 +395,23 @@ def run_sync(cfg: configparser.ConfigParser) -> dict:
     # ── 3. Vouchers in monthly batches
     total_v = 0
     today   = datetime.now()
-    start   = today - timedelta(days=days_back)
+    last_sync_date = a.get('last_voucher_sync_date', '').strip()
+    overlap_days   = int(a.get('incremental_overlap_days', '7'))
+
+    if last_sync_date:
+        # Incremental sync: resume from (last sync date - overlap), not the full days_back window.
+        try:
+            resume_from = datetime.strptime(last_sync_date, '%Y%m%d') - timedelta(days=overlap_days)
+        except ValueError:
+            resume_from = today - timedelta(days=days_back)
+        start = max(resume_from, today - timedelta(days=days_back))
+        log.info(f'Incremental voucher sync — resuming from {start.strftime("%Y-%m-%d")} '
+                 f'(last full fetch up to {last_sync_date}, {overlap_days}-day overlap)')
+    else:
+        # First-ever sync: pull the full configured history.
+        start = today - timedelta(days=days_back)
+        log.info(f'Full voucher sync — fetching last {days_back} days (no previous sync recorded)')
+
     # Build month ranges
     ranges  = []
     cursor  = start.replace(day=1)
@@ -432,6 +464,11 @@ def run_sync(cfg: configparser.ConfigParser) -> dict:
             time.sleep(1)
 
     results['vouchers'] = total_v
+    # Record progress for next incremental run — only advance if no fatal errors
+    # occurred that would mean this window wasn't fully processed.
+    if not results['errors']:
+        save_config_value('last_voucher_sync_date', today.strftime('%Y%m%d'))
+        cfg['agent']['last_voucher_sync_date'] = today.strftime('%Y%m%d')
     log.info(f'Sync done — Ledgers:{results["ledgers"]} '
              f'Stock:{results["stock"]} Vouchers:{results["vouchers"]}')
     return results
