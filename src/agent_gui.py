@@ -11,6 +11,7 @@ TallySync Mobile — Desktop Sync Agent  v4
 import os, sys, time, gzip, json, base64, hashlib, logging
 import configparser, urllib.request, urllib.error, threading, traceback
 from datetime import datetime, timedelta
+from xml.sax.saxutils import escape
 from pathlib import Path
 
 import tkinter as tk
@@ -103,7 +104,8 @@ log = _setup_logging()
 
 # ── Config ────────────────────────────────────────────────────────────────────
 DEFAULTS = {'agent': {
-    'user_id': '', 'api_key': '', 'secret_key': '',
+    'master_key': '', 'master_secret': '',
+    'user_id': '', 'api_key': '', 'secret_key': '',  # legacy single-company fallback
     'server_url': 'http://localhost/tallysync/api/ingest.php',
     'tally_host': 'http://localhost:9000',
     'interval_min': '5', 'compress': 'true', 'encrypt': 'true',
@@ -125,13 +127,44 @@ def save_cfg(cfg):
     with open(CONFIG_FILE, 'w') as f:
         cfg.write(f)
 
+def get_company_creds(cfg, company_name):
+    """Look up per-company portal credentials.
+
+    Each Tally company can be linked to a different TallySync portal account
+    (its own user_id/api_key/secret_key), via an optional config section:
+
+        [company:S.S. Electricals (from 1-Apr-25)]
+        user_id    = 12
+        api_key    = ...
+        secret_key = ...
+
+    Falls back to the [agent] defaults if no matching section exists —
+    keeps single-company setups working with zero extra config.
+    """
+    section = f'company:{company_name}'
+    def _get(key, default=''):
+        if cfg.has_section(section) and cfg.has_option(section, key):
+            return cfg.get(section, key).strip()
+        return cfg.get('agent', key).strip() if cfg.has_option('agent', key) else default
+
+    return {
+        'user_id':    _get('user_id'),
+        'api_key':    _get('api_key'),
+        'secret_key': _get('secret_key'),
+    }
+
 def is_configured():
     cfg = load_cfg()
     if not cfg.has_section('agent'):
         return False
+    mkey = cfg.get('agent','master_key').strip() if cfg.has_option('agent','master_key') else ''
+    msec = cfg.get('agent','master_secret').strip() if cfg.has_option('agent','master_secret') else ''
+    srv  = cfg.get('agent','server_url').strip() if cfg.has_option('agent','server_url') else ''
+    if mkey and msec and srv:
+        return True
+    # Legacy single-company config still works
     uid = cfg.get('agent','user_id').strip() if cfg.has_option('agent','user_id') else ''
     key = cfg.get('agent','api_key').strip() if cfg.has_option('agent','api_key') else ''
-    srv = cfg.get('agent','server_url').strip() if cfg.has_option('agent','server_url') else ''
     return bool(uid and key and srv)
 
 # ── Network helpers ───────────────────────────────────────────────────────────
@@ -145,14 +178,15 @@ def tally_post(host, xml, timeout=120):
         try:    return raw.decode('utf-8')
         except: return raw.decode('cp1252', errors='replace')
 
-def collection_xml(name, typ, fields, fd='', td=''):
+def collection_xml(name, typ, fields, fd='', td='', company=''):
     dates = (f'<SVFROMDATE>{fd}</SVFROMDATE>' if fd else '') + \
             (f'<SVTODATE>{td}</SVTODATE>'     if td else '')
+    comp  = f'<SVCURRENTCOMPANY>{escape(company)}</SVCURRENTCOMPANY>' if company else ''
     return (f'<ENVELOPE><HEADER><VERSION>1</VERSION>'
             f'<TALLYREQUEST>Export</TALLYREQUEST>'
             f'<TYPE>Collection</TYPE><ID>{name}</ID></HEADER>'
             f'<BODY><DESC><STATICVARIABLES>'
-            f'<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>{dates}'
+            f'<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>{dates}{comp}'
             f'</STATICVARIABLES><TDL><TDLMESSAGE>'
             f'<COLLECTION NAME="{name}" ISMODIFY="No">'
             f'<TYPE>{typ}</TYPE><FETCH>{",".join(fields)}</FETCH>'
@@ -161,17 +195,19 @@ def collection_xml(name, typ, fields, fd='', td=''):
 def fetch_companies(host):
     return tally_post(host, collection_xml('TSCo','Company',['NAME','GUID']), timeout=15)
 
-def fetch_ledgers(host):
+def fetch_ledgers(host, company=''):
     return tally_post(host, collection_xml('TSLed','Ledger',
-        ['GUID','ALTERID','NAME','PARENT','CLOSINGBALANCE',
-         'LEDMAILINGDETAILS.LIST.PINCODE']), timeout=60)
+        ['GUID','ALTERID','NAME','PARENT','CLOSINGBALANCE','OPENINGBALANCE',
+         'LEDMAILINGDETAILS.LIST.PINCODE','LEDMAILINGDETAILS.LIST.MAILINGNAME'],
+        company=company), timeout=60)
 
-def fetch_stock(host):
+def fetch_stock(host, company=''):
     return tally_post(host, collection_xml('TSStk','StockItem',
         ['GUID','ALTERID','NAME','PARENT','BASEUNITS',
-         'CLOSINGBALANCE','CLOSINGVALUE','RATE']), timeout=60)
+         'CLOSINGBALANCE','CLOSINGVALUE','RATE','OPENINGBALANCE','OPENINGVALUE'],
+        company=company), timeout=60)
 
-def fetch_all_vouchers(host, from_date=None, to_date=None):
+def fetch_all_vouchers(host, from_date=None, to_date=None, company=''):
     """Fetch vouchers from Tally.
 
     If from_date is given (YYYYMMDD), restricts the export to that date range
@@ -185,13 +221,14 @@ def fetch_all_vouchers(host, from_date=None, to_date=None):
             f'<SVFROMDATE>{from_date}</SVFROMDATE>'
             f'<SVTODATE>{to_d}</SVTODATE>'
         )
+    comp_var = f'<SVCURRENTCOMPANY>{escape(company)}</SVCURRENTCOMPANY>' if company else ''
     obj_xml = (
         '<ENVELOPE><HEADER><VERSION>1</VERSION>'
         '<TALLYREQUEST>Export</TALLYREQUEST>'
         '<TYPE>Collection</TYPE><ID>TSAllVch</ID></HEADER>'
         '<BODY><DESC><STATICVARIABLES>'
         '<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>'
-        f'{date_vars}'
+        f'{date_vars}{comp_var}'
         '</STATICVARIABLES>'
         '<TDL><TDLMESSAGE>'
         '<COLLECTION NAME="TSAllVch" ISMODIFY="No">'
@@ -277,7 +314,50 @@ def send_bundle(server_url, user_id, api_key, bundle_bytes,
     except Exception as ex:
         return {'ok': False, 'error': str(ex)}
 
-# ── Parse company list ────────────────────────────────────────────────────────
+def simple_post(url, fields, timeout=30):
+    """POST a simple application/x-www-form-urlencoded request, return parsed JSON."""
+    import urllib.parse
+    data = urllib.parse.urlencode(fields).encode('utf-8')
+    req = urllib.request.Request(url, data=data, method='POST',
+        headers={'Content-Type': 'application/x-www-form-urlencoded',
+                 'X-TallySync-Agent': '4.0'})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            resp = r.read().decode('utf-8', errors='replace')
+            try:    return json.loads(resp)
+            except: return {'ok': False, 'error': f'Bad JSON: {resp[:300]}'}
+    except urllib.error.HTTPError as e:
+        body2 = e.read().decode('utf-8', errors='replace')[:400]
+        return {'ok': False, 'error': f'HTTP {e.code}: {body2}'}
+    except Exception as ex:
+        return {'ok': False, 'error': str(ex)}
+
+def agent_companies_url(server_url):
+    """Derive api/agent_companies.php from the configured api/ingest.php URL."""
+    if server_url.endswith('ingest.php'):
+        return server_url[:-len('ingest.php')] + 'agent_companies.php'
+    # fallback: assume same directory
+    base = server_url.rsplit('/', 1)[0]
+    return base + '/agent_companies.php'
+
+def discover_companies_on_server(server_url, master_key, master_secret, companies):
+    """Tell the portal which Tally companies the agent can see."""
+    url = agent_companies_url(server_url)
+    return simple_post(url, {
+        'master_key': master_key,
+        'master_secret': master_secret,
+        'action': 'discover',
+        'companies_json': json.dumps([{'name': c['name'], 'guid': c.get('guid','')} for c in companies]),
+    })
+
+def list_assigned_companies(server_url, master_key, master_secret):
+    """Get the companies + per-company sync credentials the portal has activated for this user."""
+    url = agent_companies_url(server_url)
+    return simple_post(url, {
+        'master_key': master_key,
+        'master_secret': master_secret,
+        'action': 'list',
+    })
 def parse_companies(xml):
     import re
     companies = []
@@ -305,6 +385,9 @@ class TallySyncApp:
         self.stop_flag = False
         self.paused    = False
         self.companies = []
+        self.assigned = []           # companies activated on the portal (with sync creds)
+        self.pending_setup = False   # True if user must select companies on portal
+        self.setup_url = ''
         self._next_sync = time.time() + self._interval_secs()
         self._settings_win = None
         self._build_ui()
@@ -541,9 +624,8 @@ class TallySyncApp:
             justify='left').pack(anchor='w', pady=(0,10))
 
         fields = [
-            ('User ID',       'user_id',     ''),
-            ('API Key',       'api_key',     ''),
-            ('Secret Key',    'secret_key',  ''),
+            ('Master Key',    'master_key',    ''),
+            ('Master Secret', 'master_secret', ''),
             ('Tally URL',     'tally_host',  'http://localhost:9000'),
             ('Server URL',    'server_url',  'http://localhost/tallysync/api/ingest.php'),
         ]
@@ -555,7 +637,7 @@ class TallySyncApp:
                      font=('Segoe UI',9,'bold'), width=12, anchor='e').pack(side='left', padx=(0,8))
             cur = self.cfg.get('agent',key).strip() if self.cfg.has_option('agent',key) else ''
             var = tk.StringVar(value=cur)
-            show = '*' if key in ('api_key','secret_key') else ''
+            show = '*' if key in ('master_key','master_secret') else ''
             ent = tk.Entry(row, textvariable=var, font=('Segoe UI',10),
                            show=show, bg='white', relief='flat', bd=1,
                            highlightthickness=1, highlightbackground='#d1d5db',
@@ -609,6 +691,10 @@ class TallySyncApp:
 
     def _do_connect(self):
         host = self.cfg['agent'].get('tally_host','http://localhost:9000')
+        srv  = self.cfg['agent'].get('server_url','').strip()
+        mkey = self.cfg['agent'].get('master_key','').strip()
+        msec = self.cfg['agent'].get('master_secret','').strip()
+
         self._set_status('Connecting…', '#fcd34d')
         try:
             xml  = fetch_companies(host)
@@ -617,6 +703,35 @@ class TallySyncApp:
                 # Tally responded but no parsed companies — still connected
                 cos = [{'name':'(Company open in Tally)','guid':''}]
             self.companies = cos
+            self.log_append(f'TallyPrime: found {len(cos)} compan{"y" if len(cos)==1 else "ies"}', 'ok')
+
+            self.assigned = []
+            self.pending_setup = False
+            self.setup_url = ''
+            if srv and mkey and msec and cos and cos[0]['name'] != '(Company open in Tally)':
+                # Tell the portal what we see, then fetch what's actually activated
+                discover_res = discover_companies_on_server(srv, mkey, msec, cos)
+                if discover_res.get('ok'):
+                    n = discover_res.get('discovered', 0)
+                    if n: self.log_append(f'Registered {n} new compan{"y" if n==1 else "ies"} with portal', 'info')
+                else:
+                    self.log_append(f'Portal discovery failed: {discover_res.get("error")}', 'warn')
+
+                list_res = list_assigned_companies(srv, mkey, msec)
+                if list_res.get('ok'):
+                    self.assigned = list_res.get('active', [])
+                    self.pending_setup = list_res.get('pending_setup', False)
+                    self.setup_url = list_res.get('setup_url','')
+                    plan = list_res.get('plan', {})
+                    extra = list_res.get('discovered_unselected', 0)
+                    self.log_append(
+                        f'Portal: {len(self.assigned)}/{plan.get("max_companies","?")} companies active'
+                        + (f', {extra} more available' if extra else ''), 'info')
+                else:
+                    self.log_append(f'Could not load company list from portal: {list_res.get("error")}', 'warn')
+            elif not (mkey and msec):
+                self.log_append('master_key/master_secret not set — add them to config.ini (see Sync Tally page on the portal)', 'warn')
+
             self.root.after(0, self._render_companies)
             self._set_status(f'TallyPrime Connected  ({len(cos)} company found)', '#4ade80')
             self.log_append(f'Connected — {len(cos)} company', 'ok')
@@ -630,16 +745,43 @@ class TallySyncApp:
 
     def _render_companies(self):
         for w in self.co_frame.winfo_children(): w.destroy()
-        for co in self.companies:
-            row=tk.Frame(self.co_frame,bg='white'); row.pack(fill='x',padx=10,pady=3)
-            tk.Label(row,text='🏢',bg='white',font=('Segoe UI',12)).pack(side='left',padx=(0,8))
-            inf=tk.Frame(row,bg='white'); inf.pack(side='left',fill='x',expand=True)
-            tk.Label(inf,text=co['name'],bg='white',fg='#111827',
-                     font=('Segoe UI',10,'bold'),anchor='w').pack(anchor='w')
-            n=co['name']
-            self._btn(row,'▶ Sync Now',
-                lambda n=n: threading.Thread(target=self._do_sync,daemon=True).start(),
-                'primary').pack(side='right',padx=4)
+
+        assigned_names = {a['name'] for a in self.assigned}
+        # Match Tally's discovered companies against the portal's assigned list
+        tally_names = {co['name'] for co in self.companies}
+
+        if self.assigned:
+            for a in self.assigned:
+                row=tk.Frame(self.co_frame,bg='white'); row.pack(fill='x',padx=10,pady=3)
+                tk.Label(row,text='🏢',bg='white',font=('Segoe UI',12)).pack(side='left',padx=(0,8))
+                inf=tk.Frame(row,bg='white'); inf.pack(side='left',fill='x',expand=True)
+                tk.Label(inf,text=a['name'],bg='white',fg='#111827',
+                         font=('Segoe UI',10,'bold'),anchor='w').pack(anchor='w')
+                if a['name'] not in tally_names:
+                    tk.Label(inf,text='Not currently open in TallyPrime',bg='white',fg='#f59e0b',
+                             font=('Segoe UI',8),anchor='w').pack(anchor='w')
+                co = dict(a)  # company_id, name, api_key, secret_key
+                self._btn(row,'▶ Sync Now',
+                    lambda co=co: threading.Thread(target=self._do_sync,kwargs={'company':co},daemon=True).start(),
+                    'primary').pack(side='right',padx=4)
+
+        if self.pending_setup or (self.assigned and len(self.companies) > len(self.assigned)):
+            extra = max(0, len(self.companies) - len(self.assigned))
+            note = tk.Frame(self.co_frame,bg='#fff7ed'); note.pack(fill='x',padx=10,pady=(8,4))
+            msg = ('Select which companies to sync — visit My Companies on the portal.'
+                   if self.pending_setup else
+                   f'{extra} more compan{"y" if extra==1 else "ies"} found in Tally — add them on the portal (My Companies) if your plan allows.')
+            tk.Label(note,text='⚠ '+msg,bg='#fff7ed',fg='#b45309',
+                     font=('Segoe UI',9),wraplength=620,justify='left').pack(anchor='w',padx=8,pady=6)
+            if self.setup_url:
+                link = tk.Label(note,text=self.setup_url,bg='#fff7ed',fg='#1464f4',
+                                 font=('Segoe UI',9,'underline'),cursor='hand2')
+                link.pack(anchor='w',padx=8,pady=(0,6))
+                link.bind('<Button-1>', lambda e: __import__('webbrowser').open(self.setup_url))
+
+        if not self.assigned and not self.pending_setup and not self.companies:
+            tk.Label(self.co_frame,text='Click Connect to detect companies from TallyPrime.',
+                     bg='white',fg='#9ca3af',font=('Segoe UI',9)).pack(anchor='w',padx=10,pady=6)
 
     # ── SYNC ─────────────────────────────────────────────────────────────────
 
@@ -663,11 +805,31 @@ class TallySyncApp:
             return self.cfg.get('agent', k).strip() if self.cfg.has_option('agent', k) else default
         host = _gcfg('tally_host','http://localhost:9000')
         srv  = _gcfg('server_url','')
-        uid  = _gcfg('user_id','')
-        key  = _gcfg('api_key','')
-        sec  = _gcfg('secret_key','')
+
+        company_name = ''
+        if company:
+            # company is a dict: {company_id, name, api_key, secret_key, tally_guid}
+            uid = str(company.get('company_id',''))
+            key = company.get('api_key','')
+            sec = company.get('secret_key','')
+            company_name = company.get('name','')
+            self.log_append(f'Syncing "{company_name}" (company_id={uid})','info')
+        elif self.assigned:
+            # No specific company picked (e.g. "Sync Now" main button) — sync the first assigned one
+            a = self.assigned[0]
+            uid = str(a.get('company_id',''))
+            key = a.get('api_key','')
+            sec = a.get('secret_key','')
+            company_name = a.get('name','')
+            if len(self.assigned) > 1:
+                self.log_append(f'Multiple companies activated — syncing "{company_name}" first. Use each company\\'s "Sync Now" button to sync the others.','info')
+        else:
+            uid  = _gcfg('user_id','')
+            key  = _gcfg('api_key','')
+            sec  = _gcfg('secret_key','')
         cmp_ = _gcfg('compress','true').lower() == 'true'
         enc_ = _gcfg('encrypt','true').lower() == 'true'
+        company = company_name  # downstream fetch_* calls expect a name string for SVCURRENTCOMPANY
 
         if not uid or not srv:
             self.log_append('ERROR: Agent not configured. Contact your TallySync admin.','error')
@@ -676,7 +838,7 @@ class TallySyncApp:
         try:
             # ── 1. Ledgers (0→20%)
             self._progress(5,'Fetching ledgers from Tally…')
-            xml = fetch_ledgers(host)
+            xml = fetch_ledgers(host, company=company or '')
             self.log_append(f'Ledgers: {len(xml):,} bytes from Tally','dim')
             if '<LEDGER' in xml.upper():
                 self._progress(12,'Sending ledgers to server…')
@@ -694,7 +856,7 @@ class TallySyncApp:
 
             # ── 2. Stock (20→35%)
             self._progress(22,'Fetching stock items from Tally…')
-            xml = fetch_stock(host)
+            xml = fetch_stock(host, company=company or '')
             self.log_append(f'Stock: {len(xml):,} bytes from Tally','dim')
             if '<STOCKITEM' in xml.upper():
                 self._progress(28,'Sending stock items to server…')
@@ -711,7 +873,8 @@ class TallySyncApp:
             self._progress(35,'Stock done.')
 
             # ── 3. Vouchers — incremental (date-filtered) after first sync
-            last_sync_date = _gcfg('last_voucher_sync_date','').strip()
+            sync_date_key = ('last_voucher_sync_date__' + company) if company else 'last_voucher_sync_date'
+            last_sync_date = _gcfg(sync_date_key,'').strip()
             overlap_days   = int(_gcfg('incremental_overlap_days','7') or '7')
             today_str = datetime.now().strftime('%Y%m%d')
 
@@ -731,7 +894,7 @@ class TallySyncApp:
                 self._progress(40,'Fetching ALL vouchers from Tally (first sync)...')
                 self.log_append('First sync: requesting full voucher history...','info')
 
-            xml = fetch_all_vouchers(host, from_date=from_date, to_date=today_str if from_date else None)
+            xml = fetch_all_vouchers(host, from_date=from_date, to_date=today_str if from_date else None, company=company or '')
             vch_count = xml.upper().count('<VOUCHER')
             self.log_append(f'Vouchers: {len(xml):,} bytes, ~{vch_count} vouchers found','dim')
 
@@ -750,13 +913,13 @@ class TallySyncApp:
                 if res.get('error'): self.log_append(f'  -> {res.get("error")}','warn')
                 if res.get('ok'):
                     if not self.cfg.has_section('agent'): self.cfg.add_section('agent')
-                    self.cfg.set('agent','last_voucher_sync_date', today_str)
+                    self.cfg.set('agent', sync_date_key, today_str)
                     save_cfg(self.cfg)
             else:
                 self.log_append('No vouchers returned from Tally (or none in range)','warn')
                 if from_date:
                     if not self.cfg.has_section('agent'): self.cfg.add_section('agent')
-                    self.cfg.set('agent','last_voucher_sync_date', today_str)
+                    self.cfg.set('agent', sync_date_key, today_str)
                     save_cfg(self.cfg)
 
             self._progress(100,'Sync complete ✓')
@@ -855,7 +1018,7 @@ class SetupWindow:
                            fg='#a8c4e0', relief='flat', bd=0, insertbackground='white')
         self.txt.pack(fill='x', padx=20)
         self.txt.insert('end',
-            '[agent]\nuser_id    = \napi_key    = \nsecret_key = \n'
+            '[agent]\nmaster_key    = \nmaster_secret = \n'
             'server_url = http://\ntally_host = http://localhost:9000\n'
             'interval_min = 5\ncompress = true\nencrypt = true\n')
 
@@ -878,13 +1041,13 @@ class SetupWindow:
                 self.lbl_err.config(text='Error: config must start with [agent]')
                 return
             # Use has_option + get (no fallback arg) for compatibility
-            uid = cfg.get('agent','user_id').strip() if cfg.has_option('agent','user_id') else ''
-            key = cfg.get('agent','api_key').strip() if cfg.has_option('agent','api_key') else ''
-            srv = cfg.get('agent','server_url').strip() if cfg.has_option('agent','server_url') else ''
-            if not uid:
-                self.lbl_err.config(text='Error: user_id is empty'); return
-            if not key:
-                self.lbl_err.config(text='Error: api_key is empty'); return
+            mkey = cfg.get('agent','master_key').strip() if cfg.has_option('agent','master_key') else ''
+            msec = cfg.get('agent','master_secret').strip() if cfg.has_option('agent','master_secret') else ''
+            srv  = cfg.get('agent','server_url').strip() if cfg.has_option('agent','server_url') else ''
+            if not mkey:
+                self.lbl_err.config(text='Error: master_key is empty'); return
+            if not msec:
+                self.lbl_err.config(text='Error: master_secret is empty'); return
             if not srv:
                 self.lbl_err.config(text='Error: server_url is empty'); return
             # Save to AppData config file
@@ -932,53 +1095,89 @@ def run_once_headless():
         return cfg.get('agent', k).strip() if cfg.has_option('agent', k) else d
     host = _g('tally_host','http://localhost:9000')
     srv  = _g('server_url','')
-    uid  = _g('user_id','')
-    key  = _g('api_key','')
-    sec  = _g('secret_key','')
     cmp_ = _g('compress','true').lower() == 'true'
     enc_ = _g('encrypt','true').lower() == 'true'
-    if not uid or not srv:
-        log.error("Agent not configured."); return
-    log.info("=== Headless sync started ===")
-    try:
-        xml = fetch_ledgers(host)
-        if "<LEDGER" in xml.upper():
-            res = send_bundle(srv,uid,key,build_bundle(uid,"ledgers",xml),cmp_,enc_,sec)
-            log.info(f"Ledgers: {res}")
-        time.sleep(1.1)
-        xml = fetch_stock(host)
-        if "<STOCKITEM" in xml.upper():
-            res = send_bundle(srv,uid,key,build_bundle(uid,"stock",xml),cmp_,enc_,sec)
-            log.info(f"Stock: {res}")
-        time.sleep(1.1)
-        last_sync_date = _g('last_voucher_sync_date','').strip()
-        overlap_days   = int(_g('incremental_overlap_days','7') or '7')
-        today_str = datetime.now().strftime('%Y%m%d')
-        from_date = None
-        is_first  = '1'
-        if last_sync_date:
-            try:
-                from_date = (datetime.strptime(last_sync_date,'%Y%m%d') - timedelta(days=overlap_days)).strftime('%Y%m%d')
-                is_first  = '0'
-            except ValueError:
-                pass
-        xml = fetch_all_vouchers(host, from_date=from_date, to_date=today_str if from_date else None)
-        if "<VOUCHER" in xml.upper():
-            res = send_bundle(srv,uid,key,
-                    build_bundle(uid,"vouchers",xml,meta={"from_date":from_date or "","to_date":today_str if from_date else ""}),
-                    cmp_,enc_,sec,extra={"is_first":is_first})
-            log.info(f"Vouchers: {res}")
-            if res.get('ok'):
+
+    mkey = _g('master_key','')
+    msec = _g('master_secret','')
+
+    companies = []  # list of {company_id, name, api_key, secret_key}
+    if mkey and msec and srv:
+        try:
+            xml = fetch_companies(host)
+            cos = parse_companies(xml)
+            if cos:
+                discover_companies_on_server(srv, mkey, msec, cos)
+            list_res = list_assigned_companies(srv, mkey, msec)
+            if list_res.get('ok'):
+                companies = list_res.get('active', [])
+                if list_res.get('pending_setup'):
+                    log.warning(f"No companies activated yet — visit {list_res.get('setup_url','the portal')} to select companies.")
+            else:
+                log.error(f"Could not load company list: {list_res.get('error')}")
+        except Exception as e:
+            log.error(f"Company discovery failed: {e}")
+
+    if not companies:
+        # Legacy single-company fallback
+        uid = _g('user_id','')
+        key = _g('api_key','')
+        sec = _g('secret_key','')
+        if uid and key and srv:
+            companies = [{'company_id': uid, 'name': '', 'api_key': key, 'secret_key': sec}]
+
+    if not companies or not srv:
+        log.error("Agent not configured — set master_key/master_secret (and server_url) in config.ini.")
+        return
+
+    log.info(f"=== Headless sync started ({len(companies)} compan{'y' if len(companies)==1 else 'ies'}) ===")
+    for co in companies:
+        uid = str(co['company_id'])
+        key = co['api_key']
+        sec = co['secret_key']
+        cname = co.get('name','')
+        label = f' "{cname}"' if cname else ''
+        try:
+            xml = fetch_ledgers(host, company=cname)
+            if "<LEDGER" in xml.upper():
+                res = send_bundle(srv,uid,key,build_bundle(uid,"ledgers",xml),cmp_,enc_,sec)
+                log.info(f"[{uid}{label}] Ledgers: {res}")
+            time.sleep(1.1)
+            xml = fetch_stock(host, company=cname)
+            if "<STOCKITEM" in xml.upper():
+                res = send_bundle(srv,uid,key,build_bundle(uid,"stock",xml),cmp_,enc_,sec)
+                log.info(f"[{uid}{label}] Stock: {res}")
+            time.sleep(1.1)
+
+            sync_date_key = ('last_voucher_sync_date__' + cname) if cname else 'last_voucher_sync_date'
+            last_sync_date = _g(sync_date_key,'').strip()
+            overlap_days   = int(_g('incremental_overlap_days','7') or '7')
+            today_str = datetime.now().strftime('%Y%m%d')
+            from_date = None
+            is_first  = '1'
+            if last_sync_date:
+                try:
+                    from_date = (datetime.strptime(last_sync_date,'%Y%m%d') - timedelta(days=overlap_days)).strftime('%Y%m%d')
+                    is_first  = '0'
+                except ValueError:
+                    pass
+            xml = fetch_all_vouchers(host, from_date=from_date, to_date=today_str if from_date else None, company=cname)
+            if "<VOUCHER" in xml.upper():
+                res = send_bundle(srv,uid,key,
+                        build_bundle(uid,"vouchers",xml,meta={"from_date":from_date or "","to_date":today_str if from_date else ""}),
+                        cmp_,enc_,sec,extra={"is_first":is_first})
+                log.info(f"[{uid}{label}] Vouchers: {res}")
+                if res.get('ok'):
+                    if not cfg.has_section('agent'): cfg.add_section('agent')
+                    cfg.set('agent', sync_date_key, today_str)
+                    save_cfg(cfg)
+            elif from_date:
                 if not cfg.has_section('agent'): cfg.add_section('agent')
-                cfg.set('agent','last_voucher_sync_date', today_str)
+                cfg.set('agent', sync_date_key, today_str)
                 save_cfg(cfg)
-        elif from_date:
-            if not cfg.has_section('agent'): cfg.add_section('agent')
-            cfg.set('agent','last_voucher_sync_date', today_str)
-            save_cfg(cfg)
-        log.info("=== Headless sync complete ===")
-    except Exception as e:
-        log.error(f"Headless sync error: {e}")
+        except Exception as e:
+            log.error(f"[{uid}{label}] Headless sync error: {e}")
+    log.info("=== Headless sync complete ===")
 
 
 def main():
