@@ -822,7 +822,7 @@ class TallySyncApp:
             sec = a.get('secret_key','')
             company_name = a.get('name','')
             if len(self.assigned) > 1:
-                self.log_append(f'Multiple companies activated — syncing "{company_name}" first. Use each company\\'s "Sync Now" button to sync the others.','info')
+                self.log_append(f'Multiple companies activated - syncing "{company_name}" first. Use each company\'s "Sync Now" button to sync the others.','info')
         else:
             uid  = _gcfg('user_id','')
             key  = _gcfg('api_key','')
