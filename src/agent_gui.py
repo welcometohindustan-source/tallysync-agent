@@ -8,7 +8,7 @@ TallySync Mobile — Desktop Sync Agent  v4
 - Proper Windows installer via NSIS (see installer/ folder)
 """
 
-import os, sys, time, gzip, json, base64, hashlib, logging, re
+import os, sys, time, gzip, json, base64, hashlib, logging, re, socket
 import configparser, urllib.request, urllib.error, threading, traceback
 from datetime import datetime, timedelta
 from xml.sax.saxutils import escape
@@ -245,7 +245,7 @@ def fetch_vouchers_by_alterid(host, min_alterid, company=''):
         '</COLLECTION>'
         '</TDLMESSAGE>'
         '<TDLMESSAGE>'
-        f'<SYSTEM TYPE="Formulae" NAME="TSAlterFilter">$$AlterID &gt; {int(min_alterid)}</SYSTEM>'
+        f'<SYSTEM TYPE="Formulae" NAME="TSAlterFilter">$AlterId &gt; {int(min_alterid)}</SYSTEM>'
         '</TDLMESSAGE>'
         '</TDL></DESC></BODY></ENVELOPE>'
     )
@@ -254,18 +254,20 @@ def fetch_vouchers_by_alterid(host, min_alterid, company=''):
 def fetch_vouchers_by_date_range(host, from_date, to_date, company=''):
     """Fetch vouchers with DATE in [from_date, to_date] (both YYYYMMDD).
     Used to CHUNK the first/full sync into manageable pieces — a plain
-    TYPE="Voucher" collection ignores SVFROMDATE/SVTODATE, so an explicit
-    $$Date FILTER is required to actually restrict the result set."""
+    TYPE="Voucher" collection ignores SVFROMDATE/SVTODATE unless an
+    explicit FILTER references them. ##SVFROMDATE/##SVTODATE are
+    already Date-typed (set via the STATICVARIABLES below), so the
+    filter just compares $Date (the voucher's own DATE field) against
+    them directly — no string-to-date conversion needed."""
     comp_var = f'<SVCURRENTCOMPANY>{escape(company)}</SVCURRENTCOMPANY>' if company else ''
-    def _fmt(d):  # YYYYMMDD -> DD-MM-YYYY
-        return f'{d[6:8]}-{d[4:6]}-{d[0:4]}'
-    f1, f2 = _fmt(from_date), _fmt(to_date)
     xml = (
         '<ENVELOPE><HEADER><VERSION>1</VERSION>'
         '<TALLYREQUEST>Export</TALLYREQUEST>'
         '<TYPE>Collection</TYPE><ID>TSAllVch</ID></HEADER>'
         '<BODY><DESC><STATICVARIABLES>'
         '<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>'
+        f'<SVFROMDATE>{from_date}</SVFROMDATE>'
+        f'<SVTODATE>{to_date}</SVTODATE>'
         f'{comp_var}'
         '</STATICVARIABLES>'
         '<TDL><TDLMESSAGE>'
@@ -276,10 +278,7 @@ def fetch_vouchers_by_date_range(host, from_date, to_date, company=''):
         '</COLLECTION>'
         '</TDLMESSAGE>'
         '<TDLMESSAGE>'
-        f'<SYSTEM TYPE="Formulae" NAME="TSDateFilter">'
-        f'$$Date &gt;= $$StringToDate:"{f1}":"DD-MM-YYYY" AND '
-        f'$$Date &lt;= $$StringToDate:"{f2}":"DD-MM-YYYY"'
-        '</SYSTEM>'
+        '<SYSTEM TYPE="Formulae" NAME="TSDateFilter">$Date &gt;= ##SVFROMDATE AND $Date &lt;= ##SVTODATE</SYSTEM>'
         '</TDLMESSAGE>'
         '</TDL></DESC></BODY></ENVELOPE>'
     )
@@ -1037,6 +1036,9 @@ class TallySyncApp:
                     self._progress(40, f'Vouchers {frm}-{to}...')
                     xml = fetch_vouchers_by_date_range(host, frm, to, company=company or '')
                     vch_count = extract_voucher_count(xml)
+                    if '<LINEERROR>' in xml.upper():
+                        err_m = re.search(r'<LINEERROR>(.*?)</LINEERROR>', xml, re.I | re.S)
+                        self.log_append(f'  [{frm}-{to}] Tally TDL error: {(err_m.group(1) if err_m else xml[:200]).strip()}', 'error')
 
                     span_days = (to_dt - frm_dt).days + 1
                     if vch_count > max_per_chunk and span_days > 1 and depth < 12:
@@ -1240,9 +1242,17 @@ def run_tray(app_root):
     try:
         import pystray
         from PIL import Image, ImageDraw
-        img  = Image.new("RGB", (64,64), color="#0f1923")
-        draw = ImageDraw.Draw(img)
-        draw.ellipse([4,4,60,60], fill="#1464f4")
+        img = None
+        logo_path = _get_logo_path('logo.png')
+        if logo_path:
+            try:
+                img = Image.open(logo_path).convert('RGBA').resize((64,64), Image.LANCZOS)
+            except Exception:
+                img = None
+        if img is None:
+            img  = Image.new("RGB", (64,64), color="#0f1923")
+            draw = ImageDraw.Draw(img)
+            draw.ellipse([4,4,60,60], fill="#1464f4")
         def show_win(icon, item):
             app_root.after(0, app_root.deiconify)
             app_root.after(0, app_root.lift)
@@ -1257,6 +1267,68 @@ def run_tray(app_root):
         icon = pystray.Icon("TallySyncAgent", img, "TallySync Mobile", menu)
         icon.run()
     except ImportError:
+        pass
+
+
+# ── Single-instance lock ─────────────────────────────────────────────────────
+# Uses a fixed localhost TCP port as a cross-process lock. If another
+# instance already holds the port, we ask IT to show its window (via a
+# one-line message) and exit immediately instead of starting a second copy.
+SINGLE_INSTANCE_PORT = 47236
+
+def acquire_single_instance_lock():
+    """Returns a bound socket if this is the first instance, or None if
+    another instance is already running (and has been asked to show itself)."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        s.bind(('127.0.0.1', SINGLE_INSTANCE_PORT))
+        s.listen(5)
+        s.settimeout(0.5)
+        return s
+    except OSError:
+        # Another instance is already running — ask it to show its window.
+        try:
+            c = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            c.settimeout(1.0)
+            c.connect(('127.0.0.1', SINGLE_INSTANCE_PORT))
+            c.sendall(b'SHOW\n')
+            c.close()
+        except Exception:
+            pass
+        return None
+
+def start_single_instance_listener(lock_socket, root):
+    """Background thread: on any incoming connection, bring the main
+    window to front. Runs for the lifetime of the app."""
+    def _listen():
+        while True:
+            try:
+                conn, _addr = lock_socket.accept()
+                try:
+                    conn.recv(16)
+                except Exception:
+                    pass
+                conn.close()
+                root.after(0, _show_and_focus, root)
+            except socket.timeout:
+                continue
+            except OSError:
+                break  # socket closed (app shutting down)
+            except Exception:
+                continue
+    t = threading.Thread(target=_listen, daemon=True)
+    t.start()
+    return t
+
+def _show_and_focus(root):
+    try:
+        root.deiconify()
+        root.lift()
+        root.attributes('-topmost', True)
+        root.after(200, lambda: root.attributes('-topmost', False))
+        root.focus_force()
+    except Exception:
         pass
 
 
@@ -1352,6 +1424,9 @@ def run_once_headless():
                     frm = frm_dt.strftime('%Y%m%d'); to = to_dt.strftime('%Y%m%d')
                     xml = fetch_vouchers_by_date_range(host, frm, to, company=cname)
                     vch_count = extract_voucher_count(xml)
+                    if '<LINEERROR>' in xml.upper():
+                        err_m = re.search(r'<LINEERROR>(.*?)</LINEERROR>', xml, re.I | re.S)
+                        log.warning(f"[{frm}-{to}] Tally TDL error: {(err_m.group(1) if err_m else xml[:200]).strip()}")
                     span_days = (to_dt - frm_dt).days + 1
                     if vch_count > max_per_chunk and span_days > 1 and depth < 12:
                         mid = frm_dt + timedelta(days=span_days // 2 - 1)
@@ -1394,18 +1469,28 @@ def main():
     if args.once:
         run_once_headless(); return
 
+    # Single-instance check — if another GUI instance is already running,
+    # ask it to show its window and exit instead of starting a duplicate.
+    lock_socket = acquire_single_instance_lock()
+    if lock_socket is None:
+        return  # another instance is running and has been notified
+
     if not is_configured() or args.setup:
         root = tk.Tk()
         SetupWindow(root)
         root.mainloop()
-        if not is_configured(): return
+        if not is_configured():
+            lock_socket.close()
+            return
 
     root = tk.Tk()
     app  = TallySyncApp(root)
+    start_single_instance_listener(lock_socket, root)
     threading.Thread(target=run_tray, args=(root,), daemon=True).start()
     if args.tray:
         root.withdraw()
     root.mainloop()
+    lock_socket.close()
 
 
 if __name__ == "__main__":
