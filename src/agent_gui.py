@@ -8,7 +8,7 @@ TallySync Mobile — Desktop Sync Agent  v4
 - Proper Windows installer via NSIS (see installer/ folder)
 """
 
-import os, sys, time, gzip, json, base64, hashlib, logging
+import os, sys, time, gzip, json, base64, hashlib, logging, re
 import configparser, urllib.request, urllib.error, threading, traceback
 from datetime import datetime, timedelta
 from xml.sax.saxutils import escape
@@ -109,7 +109,9 @@ DEFAULTS = {'agent': {
     'server_url': 'http://localhost/tallysync/api/ingest.php',
     'tally_host': 'http://localhost:9000',
     'interval_min': '5', 'compress': 'true', 'encrypt': 'true',
-    'last_voucher_sync_date': '', 'incremental_overlap_days': '7',
+    'last_voucher_alterid': '',  # internal: AlterID watermark for incremental sync
+    'batch_days': '30',           # date-range size per chunk for the first/full sync
+    'max_vouchers_per_chunk': '1000',  # auto-split a chunk further if it exceeds this
 }}
 
 def load_cfg():
@@ -206,6 +208,100 @@ def fetch_stock(host, company=''):
         ['GUID','ALTERID','NAME','PARENT','BASEUNITS',
          'CLOSINGBALANCE','CLOSINGVALUE','RATE','OPENINGBALANCE','OPENINGVALUE'],
         company=company), timeout=60)
+
+VOUCHER_FETCH_FIELDS = (
+    'GUID,ALTERID,MASTERID,DATE,VOUCHERTYPENAME,VOUCHERNUMBER,'
+    'PARTYLEDGERNAME,NARRATION,'
+    'ALLLEDGERENTRIES.LIST.LEDGERNAME,'
+    'ALLLEDGERENTRIES.LIST.AMOUNT,'
+    'ALLLEDGERENTRIES.LIST.ISDEEMEDPOSITIVE,'
+    'INVENTORYENTRIES.LIST.STOCKITEMNAME,'
+    'INVENTORYENTRIES.LIST.ACTUALQTY,'
+    'INVENTORYENTRIES.LIST.BILLEDQTY,'
+    'INVENTORYENTRIES.LIST.RATE,'
+    'INVENTORYENTRIES.LIST.AMOUNT'
+)
+
+def fetch_vouchers_by_alterid(host, min_alterid, company=''):
+    """Fetch vouchers with ALTERID > min_alterid — i.e. vouchers created OR
+    EDITED since the last sync (Tally bumps ALTERID on every save, including
+    edits to old vouchers), regardless of voucher date. This is the
+    INCREMENTAL sync path — it naturally picks up backdated edits that a
+    date-range filter would miss."""
+    comp_var = f'<SVCURRENTCOMPANY>{escape(company)}</SVCURRENTCOMPANY>' if company else ''
+    xml = (
+        '<ENVELOPE><HEADER><VERSION>1</VERSION>'
+        '<TALLYREQUEST>Export</TALLYREQUEST>'
+        '<TYPE>Collection</TYPE><ID>TSAllVch</ID></HEADER>'
+        '<BODY><DESC><STATICVARIABLES>'
+        '<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>'
+        f'{comp_var}'
+        '</STATICVARIABLES>'
+        '<TDL><TDLMESSAGE>'
+        '<COLLECTION NAME="TSAllVch" ISMODIFY="No">'
+        '<TYPE>Voucher</TYPE>'
+        '<FILTER>TSAlterFilter</FILTER>'
+        f'<FETCH>{VOUCHER_FETCH_FIELDS}</FETCH>'
+        '</COLLECTION>'
+        '</TDLMESSAGE>'
+        '<TDLMESSAGE>'
+        f'<SYSTEM TYPE="Formulae" NAME="TSAlterFilter">$$AlterID &gt; {int(min_alterid)}</SYSTEM>'
+        '</TDLMESSAGE>'
+        '</TDL></DESC></BODY></ENVELOPE>'
+    )
+    return tally_post(host, xml, timeout=300)
+
+def fetch_vouchers_by_date_range(host, from_date, to_date, company=''):
+    """Fetch vouchers with DATE in [from_date, to_date] (both YYYYMMDD).
+    Used to CHUNK the first/full sync into manageable pieces — a plain
+    TYPE="Voucher" collection ignores SVFROMDATE/SVTODATE, so an explicit
+    $$Date FILTER is required to actually restrict the result set."""
+    comp_var = f'<SVCURRENTCOMPANY>{escape(company)}</SVCURRENTCOMPANY>' if company else ''
+    def _fmt(d):  # YYYYMMDD -> DD-MM-YYYY
+        return f'{d[6:8]}-{d[4:6]}-{d[0:4]}'
+    f1, f2 = _fmt(from_date), _fmt(to_date)
+    xml = (
+        '<ENVELOPE><HEADER><VERSION>1</VERSION>'
+        '<TALLYREQUEST>Export</TALLYREQUEST>'
+        '<TYPE>Collection</TYPE><ID>TSAllVch</ID></HEADER>'
+        '<BODY><DESC><STATICVARIABLES>'
+        '<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>'
+        f'{comp_var}'
+        '</STATICVARIABLES>'
+        '<TDL><TDLMESSAGE>'
+        '<COLLECTION NAME="TSAllVch" ISMODIFY="No">'
+        '<TYPE>Voucher</TYPE>'
+        '<FILTER>TSDateFilter</FILTER>'
+        f'<FETCH>{VOUCHER_FETCH_FIELDS}</FETCH>'
+        '</COLLECTION>'
+        '</TDLMESSAGE>'
+        '<TDLMESSAGE>'
+        f'<SYSTEM TYPE="Formulae" NAME="TSDateFilter">'
+        f'$$Date &gt;= $$StringToDate:"{f1}":"DD-MM-YYYY" AND '
+        f'$$Date &lt;= $$StringToDate:"{f2}":"DD-MM-YYYY"'
+        '</SYSTEM>'
+        '</TDLMESSAGE>'
+        '</TDL></DESC></BODY></ENVELOPE>'
+    )
+    return tally_post(host, xml, timeout=300)
+
+def extract_max_alterid(xml):
+    """Max ALTERID seen across all vouchers in a response (0 if none)."""
+    ids = [int(m) for m in re.findall(r'<ALTERID>(\d+)</ALTERID>', xml)]
+    return max(ids) if ids else 0
+
+def extract_voucher_count(xml):
+    """Approx voucher count — each voucher has exactly one <DATE> field."""
+    return len(re.findall(r'<DATE>', xml))
+
+def date_chunks(start_dt, end_dt, chunk_days):
+    """Yield (from_yyyymmdd, to_yyyymmdd) windows covering [start_dt, end_dt]."""
+    chunk_days = max(1, chunk_days)
+    cur = start_dt
+    while cur <= end_dt:
+        chunk_end = min(cur + timedelta(days=chunk_days - 1), end_dt)
+        yield cur.strftime('%Y%m%d'), chunk_end.strftime('%Y%m%d')
+        cur = chunk_end + timedelta(days=1)
 
 def fetch_all_vouchers(host, from_date=None, to_date=None, company=''):
     """Fetch vouchers from Tally.
@@ -878,55 +974,124 @@ class TallySyncApp:
             time.sleep(1.1)
             self._progress(35,'Stock done.')
 
-            # ── 3. Vouchers — incremental (date-filtered) after first sync
-            sync_date_key = ('last_voucher_sync_date__' + company) if company else 'last_voucher_sync_date'
-            last_sync_date = _gcfg(sync_date_key,'').strip()
-            overlap_days   = int(_gcfg('incremental_overlap_days','7') or '7')
-            today_str = datetime.now().strftime('%Y%m%d')
+            # ── 3. Vouchers ──────────────────────────────────────────────
+            # INCREMENTAL (after first sync): fetch only vouchers with
+            #   ALTERID > last_alterid — catches NEW vouchers AND EDITS to
+            #   old vouchers (Tally bumps ALTERID on every save).
+            # FULL (first sync, or after admin reset): chunk the whole
+            #   days_back window into batch_days-sized date ranges so a
+            #   company with a huge voucher history doesn't time out or
+            #   exceed Tally/server limits in one request.
+            alterid_key  = ('last_voucher_alterid__' + company) if company else 'last_voucher_alterid'
+            last_alterid = int(_gcfg(alterid_key, '0') or '0')
+            batch_days   = int(_gcfg('batch_days', '30') or '30')
+            today        = datetime.now()
 
-            if last_sync_date:
-                try:
-                    resume_dt = datetime.strptime(last_sync_date,'%Y%m%d') - timedelta(days=overlap_days)
-                    from_date = resume_dt.strftime('%Y%m%d')
-                except ValueError:
-                    from_date = None
-                is_first = '0'
-                self._progress(40, f'Fetching vouchers since {from_date} (incremental)...')
-                self.log_append(f'Incremental sync: fetching vouchers from {from_date} to {today_str} '
-                                 f'({overlap_days}-day overlap)','info')
+            total_fetched = 0
+            total_saved   = 0
+            max_alterid_seen = last_alterid
+            any_error = False
+
+            if last_alterid > 0:
+                # ── INCREMENTAL ──
+                self._progress(40, f'Fetching vouchers changed since AlterID {last_alterid}...')
+                self.log_append(f'Incremental sync: vouchers with AlterID > {last_alterid} '
+                                 f'(new + edited vouchers, any date)', 'info')
+                xml = fetch_vouchers_by_alterid(host, last_alterid, company=company or '')
+                vch_count = extract_voucher_count(xml)
+                self.log_append(f'Vouchers: {len(xml):,} bytes, {vch_count} changed voucher(s) found', 'dim')
+
+                if vch_count > 0:
+                    self._progress(60, 'Compressing & sending vouchers to server...')
+                    bundle = build_bundle(uid, 'vouchers', xml, meta={'from_date':'', 'to_date':''})
+                    res = send_bundle(srv, uid, key, bundle, cmp_, enc_, sec, extra={'is_first':'0'})
+                    saved   = res.get('saved', 0) if res.get('ok') else 0
+                    fetched = res.get('fetched', vch_count)
+                    total_fetched += fetched
+                    total_saved   += saved
+                    self.log_append(f'Vouchers - fetched:{fetched} saved:{saved}',
+                                     'ok' if res.get('ok') else 'error')
+                    if res.get('error'):
+                        self.log_append(f'  -> {res.get("error")}', 'warn')
+                        any_error = True
+                    if res.get('ok'):
+                        max_alterid_seen = max(max_alterid_seen, extract_max_alterid(xml))
+                else:
+                    self.log_append('No new or edited vouchers since last sync.', 'dim')
+
             else:
-                from_date = None
-                is_first  = '1'
-                self._progress(40,'Fetching ALL vouchers from Tally (first sync)...')
-                self.log_append('First sync: requesting full voucher history...','info')
+                # ── FULL SYNC, chunked by date with adaptive splitting ──
+                days_back     = int(_gcfg('days_back', '365') or '365')
+                max_per_chunk = int(_gcfg('max_vouchers_per_chunk', '1000') or '1000')
+                start = today - timedelta(days=days_back)
+                initial_chunks = list(date_chunks(start, today, batch_days))
+                self.log_append(f'First sync: fetching full voucher history in {len(initial_chunks)} '
+                                 f'window(s) of ~{batch_days} day(s), capped at {max_per_chunk} '
+                                 f'vouchers/request (oversized windows auto-split)...', 'info')
 
-            xml = fetch_all_vouchers(host, from_date=from_date, to_date=today_str if from_date else None, company=company or '')
-            vch_count = xml.upper().count('<VOUCHER')
-            self.log_append(f'Vouchers: {len(xml):,} bytes, ~{vch_count} vouchers found','dim')
+                first_chunk_sent = [False]  # mutable flag shared across recursion
 
-            if '<VOUCHER' in xml.upper():
-                self._progress(60,'Compressing & sending vouchers to server...')
-                bundle = build_bundle(uid,'vouchers',xml,
-                                      meta={'from_date':from_date or '','to_date':today_str if from_date else ''})
-                orig   = len(bundle)
-                res    = send_bundle(srv,uid,key,bundle,cmp_,enc_,sec,
-                                     extra={'is_first':is_first})
-                saved  = res.get('saved',0) if res.get('ok') else 0
-                fetched= res.get('fetched',0)
-                self.root.after(0,lambda s=saved:self.stat_vars['vouchers'].set(str(s)))
-                self.log_append(f'Vouchers - fetched:{fetched} saved:{saved}',
-                                'ok' if res.get('ok') else 'error')
-                if res.get('error'): self.log_append(f'  -> {res.get("error")}','warn')
-                if res.get('ok'):
-                    if not self.cfg.has_section('agent'): self.cfg.add_section('agent')
-                    self.cfg.set('agent', sync_date_key, today_str)
-                    save_cfg(self.cfg)
-            else:
-                self.log_append('No vouchers returned from Tally (or none in range)','warn')
-                if from_date:
-                    if not self.cfg.has_section('agent'): self.cfg.add_section('agent')
-                    self.cfg.set('agent', sync_date_key, today_str)
-                    save_cfg(self.cfg)
+                def sync_range(frm_dt, to_dt, depth=0):
+                    frm = frm_dt.strftime('%Y%m%d')
+                    to  = to_dt.strftime('%Y%m%d')
+                    self._progress(40, f'Vouchers {frm}-{to}...')
+                    xml = fetch_vouchers_by_date_range(host, frm, to, company=company or '')
+                    vch_count = extract_voucher_count(xml)
+
+                    span_days = (to_dt - frm_dt).days + 1
+                    if vch_count > max_per_chunk and span_days > 1 and depth < 12:
+                        # Too many vouchers in this window — split in half and retry each half
+                        mid = frm_dt + timedelta(days=span_days // 2 - 1)
+                        self.log_append(f'  [{frm}-{to}] {vch_count} vouchers > {max_per_chunk} — splitting', 'dim')
+                        sync_range(frm_dt, mid, depth + 1)
+                        sync_range(mid + timedelta(days=1), to_dt, depth + 1)
+                        return
+
+                    is_first = '1' if not first_chunk_sent[0] else '0'
+
+                    # Always send the very first window (even if empty) so the
+                    # server's one-time clear runs; skip later empty windows.
+                    if vch_count > 0 or not first_chunk_sent[0]:
+                        first_chunk_sent[0] = True
+                        bundle = build_bundle(uid, 'vouchers', xml, meta={'from_date':frm, 'to_date':to})
+                        res = send_bundle(srv, uid, key, bundle, cmp_, enc_, sec, extra={'is_first':is_first})
+                        saved   = res.get('saved', 0) if res.get('ok') else 0
+                        fetched = res.get('fetched', vch_count)
+                        nonlocal total_fetched, total_saved, max_alterid_seen, any_error
+                        total_fetched += fetched
+                        total_saved   += saved
+                        self.log_append(f'  [{frm}-{to}] {vch_count} voucher(s) — fetched:{fetched} saved:{saved}',
+                                         'ok' if res.get('ok') else 'error')
+                        if res.get('error'):
+                            self.log_append(f'    -> {res.get("error")}', 'warn')
+                            any_error = True
+                        if res.get('ok'):
+                            max_alterid_seen = max(max_alterid_seen, extract_max_alterid(xml))
+                    else:
+                        self.log_append(f'  [{frm}-{to}] 0 vouchers — skipped', 'dim')
+
+                    time.sleep(0.3)  # small pacing between chunk requests
+
+                for frm_str, to_str in initial_chunks:
+                    sync_range(datetime.strptime(frm_str, '%Y%m%d'), datetime.strptime(to_str, '%Y%m%d'))
+
+            self.root.after(0, lambda s=total_saved: self.stat_vars['vouchers'].set(str(s)))
+            self.log_append(f'Vouchers total — fetched:{total_fetched} saved:{total_saved}',
+                             'ok' if not any_error else 'warn')
+
+            # Persist the new AlterID watermark only if nothing failed —
+            # a failed chunk should be retried (as part of the full-sync
+            # range) on the next run rather than being skipped forever.
+            if not any_error and max_alterid_seen > last_alterid:
+                if not self.cfg.has_section('agent'): self.cfg.add_section('agent')
+                self.cfg.set('agent', alterid_key, str(max_alterid_seen))
+                save_cfg(self.cfg)
+            elif not any_error and last_alterid == 0 and max_alterid_seen == 0:
+                # First sync ran but no vouchers exist at all yet — still
+                # mark as "done" so we don't re-run a full sync every time.
+                if not self.cfg.has_section('agent'): self.cfg.add_section('agent')
+                self.cfg.set('agent', alterid_key, '0')
+                save_cfg(self.cfg)
 
             self._progress(100,'Sync complete ✓')
             now = datetime.now().strftime('%d %b %Y, %H:%M')
@@ -1155,31 +1320,63 @@ def run_once_headless():
                 log.info(f"[{uid}{label}] Stock: {res}")
             time.sleep(1.1)
 
-            sync_date_key = ('last_voucher_sync_date__' + cname) if cname else 'last_voucher_sync_date'
-            last_sync_date = _g(sync_date_key,'').strip()
-            overlap_days   = int(_g('incremental_overlap_days','7') or '7')
-            today_str = datetime.now().strftime('%Y%m%d')
-            from_date = None
-            is_first  = '1'
-            if last_sync_date:
-                try:
-                    from_date = (datetime.strptime(last_sync_date,'%Y%m%d') - timedelta(days=overlap_days)).strftime('%Y%m%d')
-                    is_first  = '0'
-                except ValueError:
-                    pass
-            xml = fetch_all_vouchers(host, from_date=from_date, to_date=today_str if from_date else None, company=cname)
-            if "<VOUCHER" in xml.upper():
-                res = send_bundle(srv,uid,key,
-                        build_bundle(uid,"vouchers",xml,meta={"from_date":from_date or "","to_date":today_str if from_date else ""}),
-                        cmp_,enc_,sec,extra={"is_first":is_first})
-                log.info(f"[{uid}{label}] Vouchers: {res}")
-                if res.get('ok'):
-                    if not cfg.has_section('agent'): cfg.add_section('agent')
-                    cfg.set('agent', sync_date_key, today_str)
-                    save_cfg(cfg)
-            elif from_date:
+            alterid_key  = ('last_voucher_alterid__' + cname) if cname else 'last_voucher_alterid'
+            last_alterid = int(_g(alterid_key, '0') or '0')
+            batch_days   = int(_g('batch_days', '30') or '30')
+            max_per_chunk = int(_g('max_vouchers_per_chunk', '1000') or '1000')
+            today = datetime.now()
+            max_alterid_seen = last_alterid
+            any_error = False
+
+            if last_alterid > 0:
+                xml = fetch_vouchers_by_alterid(host, last_alterid, company=cname)
+                vch_count = extract_voucher_count(xml)
+                if vch_count > 0:
+                    res = send_bundle(srv,uid,key,
+                            build_bundle(uid,"vouchers",xml,meta={"from_date":"","to_date":""}),
+                            cmp_,enc_,sec,extra={"is_first":"0"})
+                    log.info(f"[{uid}{label}] Vouchers (incremental, {vch_count} changed): {res}")
+                    if res.get('ok'):
+                        max_alterid_seen = max(max_alterid_seen, extract_max_alterid(xml))
+                    else:
+                        any_error = True
+                else:
+                    log.info(f"[{uid}{label}] No new or edited vouchers since AlterID {last_alterid}")
+            else:
+                days_back = int(_g('days_back','365') or '365')
+                start = today - timedelta(days=days_back)
+                first_sent = [False]
+
+                def sync_range(frm_dt, to_dt, depth=0):
+                    nonlocal max_alterid_seen, any_error
+                    frm = frm_dt.strftime('%Y%m%d'); to = to_dt.strftime('%Y%m%d')
+                    xml = fetch_vouchers_by_date_range(host, frm, to, company=cname)
+                    vch_count = extract_voucher_count(xml)
+                    span_days = (to_dt - frm_dt).days + 1
+                    if vch_count > max_per_chunk and span_days > 1 and depth < 12:
+                        mid = frm_dt + timedelta(days=span_days // 2 - 1)
+                        sync_range(frm_dt, mid, depth+1)
+                        sync_range(mid + timedelta(days=1), to_dt, depth+1)
+                        return
+                    if vch_count > 0 or not first_sent[0]:
+                        is_first = '1' if not first_sent[0] else '0'
+                        first_sent[0] = True
+                        res = send_bundle(srv,uid,key,
+                                build_bundle(uid,"vouchers",xml,meta={"from_date":frm,"to_date":to}),
+                                cmp_,enc_,sec,extra={"is_first":is_first})
+                        log.info(f"[{uid}{label}] Vouchers [{frm}-{to}] ({vch_count}): {res}")
+                        if res.get('ok'):
+                            max_alterid_seen = max(max_alterid_seen, extract_max_alterid(xml))
+                        else:
+                            any_error = True
+                    time.sleep(0.3)
+
+                for frm_str, to_str in date_chunks(start, today, batch_days):
+                    sync_range(datetime.strptime(frm_str,'%Y%m%d'), datetime.strptime(to_str,'%Y%m%d'))
+
+            if not any_error and max_alterid_seen >= last_alterid:
                 if not cfg.has_section('agent'): cfg.add_section('agent')
-                cfg.set('agent', sync_date_key, today_str)
+                cfg.set('agent', alterid_key, str(max_alterid_seen))
                 save_cfg(cfg)
         except Exception as e:
             log.error(f"[{uid}{label}] Headless sync error: {e}")
