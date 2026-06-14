@@ -713,7 +713,10 @@ class TallySyncApp:
                 discover_res = discover_companies_on_server(srv, mkey, msec, cos)
                 if discover_res.get('ok'):
                     n = discover_res.get('discovered', 0)
-                    if n: self.log_append(f'Registered {n} new compan{"y" if n==1 else "ies"} with portal', 'info')
+                    m = discover_res.get('matched_existing', 0)
+                    seen = discover_res.get('names_seen', [])
+                    self.log_append(f'Sent to portal: {seen}', 'dim')
+                    self.log_append(f'Portal discover: {m} matched existing, {n} newly registered', 'info')
                 else:
                     self.log_append(f'Portal discovery failed: {discover_res.get("error")}', 'warn')
 
@@ -724,9 +727,12 @@ class TallySyncApp:
                     self.setup_url = list_res.get('setup_url','')
                     plan = list_res.get('plan', {})
                     extra = list_res.get('discovered_unselected', 0)
+                    extra_names = list_res.get('discovered_names', [])
+                    active_names = [a.get('name','') for a in self.assigned]
+                    self.log_append(f'Portal active companies: {active_names}', 'dim')
                     self.log_append(
                         f'Portal: {len(self.assigned)}/{plan.get("max_companies","?")} companies active'
-                        + (f', {extra} more available' if extra else ''), 'info')
+                        + (f', {extra} more available: {extra_names}' if extra else ''), 'info')
                 else:
                     self.log_append(f'Could not load company list from portal: {list_res.get("error")}', 'warn')
             elif not (mkey and msec):
