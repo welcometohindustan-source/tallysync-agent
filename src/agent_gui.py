@@ -303,14 +303,29 @@ def split_vouchers_xml(xml, batch_size=500):
     return batches
 
 def extract_max_alterid(xml):
-    """Max ALTERID seen across all vouchers in a response (0 if none)."""
-    ids = [int(m) for m in re.findall(r'<ALTERID>(\d+)</ALTERID>', xml)]
+    """Max ALTERID seen across all vouchers in a response (0 if none).
+
+    NOTE: must tolerate tag attributes (e.g. <ALTERID TYPE="Number">) and
+    surrounding whitespace/newlines around the digits — Tally's actual XML
+    export doesn't always match a strict '<ALTERID>123</ALTERID>' pattern.
+    The server side (tally_client.php) already parses it this way; this
+    mirrors that so the local watermark advances correctly."""
+    ids = []
+    for m in re.findall(r'<ALTERID[^>]*>(.*?)</ALTERID>', xml, re.I | re.S):
+        m = m.strip()
+        if m.isdigit():
+            ids.append(int(m))
     return max(ids) if ids else 0
 
 def extract_date_range(xml):
     """(min_date, max_date) as YYYYMMDD strings found in <DATE> tags, or
-    (None, None) if no dates present. Used for informational logging only."""
-    dates = re.findall(r'<DATE>(\d{8})</DATE>', xml)
+    (None, None) if no dates present. Used for informational logging only.
+    Tolerant of tag attributes / whitespace — see extract_max_alterid."""
+    dates = []
+    for m in re.findall(r'<DATE[^>]*>(.*?)</DATE>', xml, re.I | re.S):
+        m = m.strip()
+        if re.match(r'^\d{8}$', m):
+            dates.append(m)
     if not dates:
         return (None, None)
     return (min(dates), max(dates))
@@ -841,6 +856,7 @@ class TallySyncApp:
                     self.log_append(
                         f'Portal: {len(self.assigned)}/{plan.get("max_companies","?")} companies active'
                         + (f', {extra} more available: {extra_names}' if extra else ''), 'info')
+                    self._sync_watermarks_from_server()
                 else:
                     self.log_append(f'Could not load company list from portal: {list_res.get("error")}', 'warn')
             elif not (mkey and msec):
@@ -856,6 +872,56 @@ class TallySyncApp:
     def _set_status(self, msg, color):
         self.root.after(0, lambda: self.lbl_status.config(text=msg, fg=color))
         self.root.after(0, lambda: self.dot.config(fg=color))
+
+    def _sync_watermarks_from_server(self):
+        """Pull each active company's last_voucher_alterid / last_sync_at
+        from the portal (Phase 1 additions to agent_companies.php) and:
+          - seed the local AlterID watermark if the server's is higher
+            than (or local is missing) — keeps incremental sync working
+            even after a reinstall / config.ini loss.
+          - update the 'Last sync' label at the top of the window from the
+            portal's record, so a freshly reinstalled agent doesn't show
+            'Never' when data has already been synced before.
+        Never moves a watermark backwards.
+        """
+        changed = False
+        most_recent = None  # 'YYYY-MM-DD HH:MM:SS' string, compared lexically (safe for this format)
+        for a in self.assigned:
+            name = a.get('name', '')
+            key  = ('last_voucher_alterid__' + name) if name else 'last_voucher_alterid'
+            try:
+                server_alterid = int(a.get('last_voucher_alterid', 0) or 0)
+            except (TypeError, ValueError):
+                server_alterid = 0
+            local_alterid = 0
+            if self.cfg.has_option('agent', key):
+                try:
+                    local_alterid = int(self.cfg.get('agent', key).strip() or '0')
+                except ValueError:
+                    local_alterid = 0
+            if server_alterid > local_alterid:
+                if not self.cfg.has_section('agent'):
+                    self.cfg.add_section('agent')
+                self.cfg.set('agent', key, str(server_alterid))
+                changed = True
+                self.log_append(
+                    f'"{name}": resuming from portal AlterID watermark {server_alterid}'
+                    + (f' (local was {local_alterid})' if local_alterid else ''), 'info')
+
+            last_sync = a.get('last_sync_at')
+            if last_sync and (most_recent is None or last_sync > most_recent):
+                most_recent = last_sync
+
+        if changed:
+            save_cfg(self.cfg)
+
+        if most_recent:
+            try:
+                dt = datetime.strptime(most_recent, '%Y-%m-%d %H:%M:%S')
+                pretty = dt.strftime('%d %b %Y, %H:%M')
+            except ValueError:
+                pretty = most_recent
+            self.root.after(0, lambda t=pretty: self.lbl_last.config(text=f'Last sync: {t}', fg='#4ade80'))
 
     def _render_companies(self):
         for w in self.co_frame.winfo_children(): w.destroy()
@@ -1393,6 +1459,13 @@ def run_once_headless():
 
             alterid_key  = ('last_voucher_alterid__' + cname) if cname else 'last_voucher_alterid'
             last_alterid = int(_g(alterid_key, '0') or '0')
+            try:
+                server_alterid = int(co.get('last_voucher_alterid', 0) or 0)
+            except (TypeError, ValueError):
+                server_alterid = 0
+            if server_alterid > last_alterid:
+                log.info(f"[{uid}{label}] Resuming from portal AlterID watermark {server_alterid} (local was {last_alterid})")
+                last_alterid = server_alterid
             batch_size   = int(_g('voucher_batch_size', '500') or '500')
             max_alterid_seen = last_alterid
             any_error = False
