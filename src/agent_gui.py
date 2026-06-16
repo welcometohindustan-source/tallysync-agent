@@ -528,13 +528,22 @@ class TallySyncApp:
 
     def _build_ui(self):
         self.root.title('TallySync Mobile — Sync Agent')
-        self.root.geometry('600x530')   # shorter — no log panel
+        self.root.geometry('600x420')
         self.root.resizable(False, False)
         self.root.configure(bg='#f0f4f8')
         self.root.protocol('WM_DELETE_WINDOW', self._on_close)
         set_window_icon(self.root)
 
-        # Header
+        # ── Footer (packed FIRST so it's reserved before expand takes over) ──
+        footer = tk.Frame(self.root, bg='#e5e7eb', height=24)
+        footer.pack(fill='x', side='bottom')
+        footer.pack_propagate(False)
+        tk.Label(footer, text='For help mail to: rajsys.mtr@gmail.com',
+                 bg='#e5e7eb', fg='#6b7280', font=('Segoe UI', 8)).pack(side='left', padx=10)
+        tk.Label(footer, text='Designed by Raj Systems & Technologies',
+                 bg='#e5e7eb', fg='#6b7280', font=('Segoe UI', 8)).pack(side='right', padx=10)
+
+        # ── Header ───────────────────────────────────────────────────────────
         hdr = tk.Frame(self.root, bg='#0f1923', height=60)
         hdr.pack(fill='x'); hdr.pack_propagate(False)
         self._logo_img = load_logo_image(size=(36,36))
@@ -548,7 +557,7 @@ class TallySyncApp:
         tk.Label(hdr, text='Agent v4.0', bg='#0f1923', fg='#6b8cae',
                  font=('Segoe UI',10)).pack(side='right', padx=18)
 
-        # Status bar
+        # ── Status bar ───────────────────────────────────────────────────────
         sb = tk.Frame(self.root, bg='#1d2939', height=36)
         sb.pack(fill='x'); sb.pack_propagate(False)
         self.dot = tk.Label(sb, text='●', bg='#1d2939', fg='#4b5563', font=('Segoe UI',13))
@@ -560,6 +569,7 @@ class TallySyncApp:
                                   font=('Segoe UI',9))
         self.lbl_last.pack(side='right', padx=14)
 
+        # ── Scrollable content area ───────────────────────────────────────────
         content = tk.Frame(self.root, bg='#f0f4f8')
         content.pack(fill='both', expand=True, padx=14, pady=10)
 
@@ -577,64 +587,25 @@ class TallySyncApp:
 
         self.btn_connect  = self._btn(btn_row, '🔌  Connect',   self._connect,       'light')
         self.btn_connect.pack(side='left', padx=(0,6))
-
-        # Label starts as "Sync Now"; _render_companies updates it to "Sync All"
-        # when more than one company is listed.
         self.btn_sync_all = self._btn(btn_row, '▶  Sync Now',  self._sync_all,      'primary')
         self.btn_sync_all.pack(side='left')
-
         self.btn_stop     = self._btn(btn_row, '⏹  Stop',      self._stop,          'danger')
         self.btn_stop.pack(side='left', padx=(6,0))
         self.btn_stop.config(state='disabled')
-
         self.btn_pause    = self._btn(btn_row, '⏸  Pause',     self._toggle_pause,  'light')
         self.btn_pause.pack(side='left', padx=(6,0))
-
         self.btn_settings = self._btn(btn_row, '⚙  Settings',  self._open_settings, 'light')
         self.btn_settings.pack(side='right', padx=(6,0))
-
         self.btn_test     = self._btn(btn_row, '🔍  Test',      self._test_server,   'light')
         self.btn_test.pack(side='right')
-
-        # ── Progress card ────────────────────────────────────────────────────
-        self._card(content, '📊  Sync Progress', 'progress')
-        self.lbl_task = tk.Label(self.progress_body, text='Idle — waiting for next sync',
-            bg='white', fg='#374151', font=('Segoe UI',10), anchor='w')
-        self.lbl_task.pack(fill='x', padx=10, pady=(8,4))
-        style = ttk.Style()
-        style.theme_use('default')
-        style.configure('TS.Horizontal.TProgressbar',
-            troughcolor='#e5e7eb', background='#1464f4', thickness=18, borderwidth=0)
-        self.pvar = tk.DoubleVar()
-        self.pbar = ttk.Progressbar(self.progress_body, variable=self.pvar, maximum=100,
-                                     length=555, style='TS.Horizontal.TProgressbar')
-        self.pbar.pack(padx=10, pady=(0,4))
-        self.lbl_pct = tk.Label(self.progress_body, text='0%', bg='white',
-                                 fg='#6b7280', font=('Segoe UI',9), anchor='e')
-        self.lbl_pct.pack(fill='x', padx=10)
-
-        stats = tk.Frame(self.progress_body, bg='white')
-        stats.pack(fill='x', padx=10, pady=(4,10))
-        self.stat_vars = {}
-        for i,(k,lbl) in enumerate([('ledgers','Ledgers'),('stock','Stock Items'),('vouchers','Vouchers')]):
-            f=tk.Frame(stats,bg='#f8fafc',bd=1,relief='groove'); f.grid(row=0,column=i,padx=4,sticky='ew')
-            stats.columnconfigure(i,weight=1)
-            tk.Label(f,text=lbl,bg='#f8fafc',fg='#6b7280',font=('Segoe UI',8)).pack(pady=(6,0))
-            v=tk.StringVar(value='—'); self.stat_vars[k]=v
-            tk.Label(f,textvariable=v,bg='#f8fafc',fg='#111827',font=('Segoe UI',14,'bold')).pack(pady=(2,6))
 
         # ── Countdown ────────────────────────────────────────────────────────
         self.lbl_next = tk.Label(self.root, text='', bg='#f0f4f8', fg='#9ca3af',
                                   font=('Segoe UI',8))
         self.lbl_next.pack(pady=(0,2))
 
-        # ── Footer bar ───────────────────────────────────────────────────────
-        footer = tk.Frame(self.root, bg='#e5e7eb', height=24)
-        footer.pack(fill='x', side='bottom'); footer.pack_propagate(False)
-        tk.Label(footer, text='For help mail to: rajsys.mtr@gmail.com',
-                 bg='#e5e7eb', fg='#6b7280', font=('Segoe UI', 8)).pack(side='left', padx=10)
-        tk.Label(footer, text='Designed by Raj Systems & Technologies',
-                 bg='#e5e7eb', fg='#6b7280', font=('Segoe UI', 8)).pack(side='right', padx=10)
+        # Per-company progress bar dict — populated by _render_companies
+        self.co_progress = {}   # name → {'bar': Canvas, 'fill': int (canvas item)}
 
     def _card(self, parent, title, key):
         f=tk.Frame(parent,bg='white',bd=1,relief='flat',highlightthickness=1,
@@ -667,7 +638,7 @@ class TallySyncApp:
         rem = int(self._next_sync - time.time())
         if rem <= 0:
             if not self.syncing:
-                threading.Thread(target=self._do_sync, daemon=True).start()
+                threading.Thread(target=self._do_sync_all_thread, daemon=True).start()
             self._next_sync = time.time() + self._interval_secs()
             rem = self._interval_secs()
         m,s = divmod(rem,60)
@@ -925,11 +896,11 @@ class TallySyncApp:
 
     def _render_companies(self):
         for w in self.co_frame.winfo_children(): w.destroy()
+        self.co_progress = {}
 
         assigned_names = {a['name'] for a in self.assigned}
         tally_names    = {co['name'] for co in self.companies}
 
-        # Rename the main button based on how many companies are assigned
         if len(self.assigned) > 1:
             self.btn_sync_all.config(text='▶  Sync All')
         else:
@@ -937,43 +908,108 @@ class TallySyncApp:
 
         if self.assigned:
             for a in self.assigned:
-                row=tk.Frame(self.co_frame,bg='white'); row.pack(fill='x',padx=10,pady=3)
-                tk.Label(row,text='🏢',bg='white',font=('Segoe UI',12)).pack(side='left',padx=(0,8))
-                inf=tk.Frame(row,bg='white'); inf.pack(side='left',fill='x',expand=True)
-                tk.Label(inf,text=a['name'],bg='white',fg='#111827',
-                         font=('Segoe UI',10,'bold'),anchor='w').pack(anchor='w')
-                if a['name'] not in tally_names:
-                    tk.Label(inf,text='Not currently open in TallyPrime',bg='white',fg='#f59e0b',
-                             font=('Segoe UI',8),anchor='w').pack(anchor='w')
-                co = dict(a)  # company_id, name, api_key, secret_key
-                self._btn(row,'▶ Sync Now',
-                    lambda co=co: threading.Thread(target=self._do_sync,kwargs={'company':co},daemon=True).start(),
-                    'primary').pack(side='right',padx=4)
+                cname = a['name']
+
+                # Company row
+                row = tk.Frame(self.co_frame, bg='white')
+                row.pack(fill='x', padx=10, pady=(4, 0))
+                tk.Label(row, text='🏢', bg='white',
+                         font=('Segoe UI',12)).pack(side='left', padx=(0,8))
+                inf = tk.Frame(row, bg='white')
+                inf.pack(side='left', fill='x', expand=True)
+                tk.Label(inf, text=cname, bg='white', fg='#111827',
+                         font=('Segoe UI',10,'bold'), anchor='w').pack(anchor='w')
+                if cname not in tally_names:
+                    tk.Label(inf, text='Not currently open in TallyPrime',
+                             bg='white', fg='#f59e0b',
+                             font=('Segoe UI',8), anchor='w').pack(anchor='w')
+
+                co = dict(a)
+                self._btn(row, '▶ Sync Now',
+                    lambda co=co: threading.Thread(
+                        target=self._do_sync_one, kwargs={'company': co}, daemon=True
+                    ).start(),
+                    'primary').pack(side='right', padx=4)
+
+                # Thin progress bar — 5px tall, 240px wide, with status label
+                bar_frame = tk.Frame(self.co_frame, bg='white')
+                bar_frame.pack(fill='x', padx=18, pady=(2, 6))
+                BAR_W, BAR_H = 240, 5
+                canvas = tk.Canvas(bar_frame, width=BAR_W, height=BAR_H,
+                                   bg='#e5e7eb', highlightthickness=0, bd=0)
+                canvas.pack(side='left')
+                status_var = tk.StringVar(value='Idle')
+                tk.Label(bar_frame, textvariable=status_var,
+                         bg='white', fg='#9ca3af',
+                         font=('Segoe UI', 8)).pack(side='left', padx=(8, 0))
+                fill_id = canvas.create_rectangle(0, 0, 0, BAR_H,
+                                                  fill='#1464f4', outline='')
+                self.co_progress[cname] = {
+                    'canvas': canvas,
+                    'fill':   fill_id,
+                    'width':  BAR_W,
+                    'status': status_var,
+                }
 
         if self.pending_setup or (self.assigned and len(self.companies) > len(self.assigned)):
             extra = max(0, len(self.companies) - len(self.assigned))
-            note = tk.Frame(self.co_frame,bg='#fff7ed'); note.pack(fill='x',padx=10,pady=(8,4))
+            note  = tk.Frame(self.co_frame, bg='#fff7ed')
+            note.pack(fill='x', padx=10, pady=(8,4))
             msg = ('Select which companies to sync — visit My Companies on the portal.'
                    if self.pending_setup else
                    f'{extra} more compan{"y" if extra==1 else "ies"} found in Tally — add them on the portal (My Companies) if your plan allows.')
-            tk.Label(note,text='⚠ '+msg,bg='#fff7ed',fg='#b45309',
-                     font=('Segoe UI',9),wraplength=620,justify='left').pack(anchor='w',padx=8,pady=6)
+            tk.Label(note, text='⚠ '+msg, bg='#fff7ed', fg='#b45309',
+                     font=('Segoe UI',9), wraplength=520, justify='left').pack(anchor='w', padx=8, pady=6)
             if self.setup_url:
-                link = tk.Label(note,text=self.setup_url,bg='#fff7ed',fg='#1464f4',
-                                 font=('Segoe UI',9,'underline'),cursor='hand2')
-                link.pack(anchor='w',padx=8,pady=(0,6))
+                link = tk.Label(note, text=self.setup_url, bg='#fff7ed', fg='#1464f4',
+                                font=('Segoe UI',9,'underline'), cursor='hand2')
+                link.pack(anchor='w', padx=8, pady=(0,6))
                 link.bind('<Button-1>', lambda e: __import__('webbrowser').open(self.setup_url))
 
         if not self.assigned and not self.pending_setup and not self.companies:
-            tk.Label(self.co_frame,text='Click Connect to detect companies from TallyPrime.',
-                     bg='white',fg='#9ca3af',font=('Segoe UI',9)).pack(anchor='w',padx=10,pady=6)
+            tk.Label(self.co_frame, text='Click Connect to detect companies from TallyPrime.',
+                     bg='white', fg='#9ca3af',
+                     font=('Segoe UI',9)).pack(anchor='w', padx=10, pady=6)
 
     # ── SYNC ─────────────────────────────────────────────────────────────────
 
     def _sync_all(self):
+        """Main button — syncs ALL assigned companies sequentially."""
         if self.syncing:
-            messagebox.showinfo('Sync running','A sync is already in progress.'); return
-        threading.Thread(target=self._do_sync, daemon=True).start()
+            messagebox.showinfo('Sync running', 'A sync is already in progress.')
+            return
+        threading.Thread(target=self._do_sync_all_thread, daemon=True).start()
+
+    def _do_sync_all_thread(self):
+        """Worker: iterate over every assigned company and sync each one."""
+        if self.syncing: return
+        self.syncing    = True
+        self.stop_flag  = False
+        self.root.after(0, lambda: self.btn_sync_all.config(state='disabled'))
+        self.root.after(0, lambda: self.btn_stop.config(state='normal'))
+        try:
+            companies_to_sync = list(self.assigned)
+            for co in companies_to_sync:
+                if self.stop_flag:
+                    self.log_append('Sync All stopped before next company.', 'warn')
+                    break
+                self._sync_one_company(co)
+        finally:
+            self._sync_done()
+
+    def _do_sync_one(self, company):
+        """Per-row Sync Now button — syncs a single company."""
+        if self.syncing:
+            messagebox.showinfo('Sync running', 'A sync is already in progress.')
+            return
+        self.syncing   = True
+        self.stop_flag = False
+        self.root.after(0, lambda: self.btn_sync_all.config(state='disabled'))
+        self.root.after(0, lambda: self.btn_stop.config(state='normal'))
+        try:
+            self._sync_one_company(company)
+        finally:
+            self._sync_done()
 
     def _stop(self):
         if not self.syncing:
@@ -983,13 +1019,9 @@ class TallySyncApp:
         self._progress(0, 'Stopping…')
         self.root.after(0, lambda: self.btn_stop.config(state='disabled', text='⏹  Stopping…'))
 
-    def _do_sync(self, company=None):
-        if self.syncing: return
-        self.syncing=True; self.stop_flag=False
-        self.root.after(0,lambda:self.btn_sync_all.config(state='disabled'))
-        self.root.after(0,lambda:self.btn_stop.config(state='normal'))
-        self._progress(0,'Starting sync…')
-
+    def _sync_one_company(self, company=None):
+        """Core sync for a single company dict. Called by both _do_sync_all_thread
+        and _do_sync_one. Updates the per-company thin progress bar."""
         def _gcfg(k, default=''):
             return self.cfg.get('agent', k).strip() if self.cfg.has_option('agent', k) else default
         host = _gcfg('tally_host','http://localhost:9000')
@@ -997,120 +1029,101 @@ class TallySyncApp:
 
         company_name = ''
         if company:
-            # company is a dict: {company_id, name, api_key, secret_key, tally_guid}
-            uid = str(company.get('company_id',''))
-            key = company.get('api_key','')
-            sec = company.get('secret_key','')
+            uid          = str(company.get('company_id',''))
+            key          = company.get('api_key','')
+            sec          = company.get('secret_key','')
             company_name = company.get('name','')
-            self.log_append(f'Syncing "{company_name}" (company_id={uid})','info')
+            self.log_append(f'Syncing "{company_name}" (company_id={uid})', 'info')
         elif self.assigned:
-            # No specific company picked (e.g. "Sync Now" main button) — sync the first assigned one
-            a = self.assigned[0]
-            uid = str(a.get('company_id',''))
-            key = a.get('api_key','')
-            sec = a.get('secret_key','')
+            a            = self.assigned[0]
+            uid          = str(a.get('company_id',''))
+            key          = a.get('api_key','')
+            sec          = a.get('secret_key','')
             company_name = a.get('name','')
-            if len(self.assigned) > 1:
-                self.log_append(f'Multiple companies activated - syncing "{company_name}" first. Use each company\'s "Sync Now" button to sync the others.','info')
         else:
-            uid  = _gcfg('user_id','')
-            key  = _gcfg('api_key','')
-            sec  = _gcfg('secret_key','')
-        cmp_ = _gcfg('compress','true').lower() == 'true'
-        enc_ = _gcfg('encrypt','true').lower() == 'true'
-        company = company_name  # downstream fetch_* calls expect a name string for SVCURRENTCOMPANY
+            uid          = _gcfg('user_id','')
+            key          = _gcfg('api_key','')
+            sec          = _gcfg('secret_key','')
+
+        cmp_    = _gcfg('compress','true').lower() == 'true'
+        enc_    = _gcfg('encrypt','true').lower() == 'true'
+        company = company_name
 
         if not uid or not srv:
             self.log_append('ERROR: Agent not configured. Contact your TallySync admin.','error')
-            self._sync_done(); return
+            return
 
         try:
-            # ── 1. Ledgers (0→20%)
-            self._progress(5,'Fetching ledgers from Tally…')
+            # ── 1. Ledgers ───────────────────────────────────────────────────
+            self._co_progress(company_name, 5, 'Fetching ledgers…')
             xml = fetch_ledgers(host, company=company or '')
             self.log_append(f'Ledgers: {len(xml):,} bytes from Tally','dim')
             if '<LEDGER' in xml.upper():
-                self._progress(12,'Sending ledgers to server…')
+                self._co_progress(company_name, 12, 'Sending ledgers…')
                 bundle = build_bundle(uid,'ledgers',xml)
                 res    = send_bundle(srv,uid,key,bundle,cmp_,enc_,sec)
                 saved  = res.get('saved',0) if res.get('ok') else 0
-                self.root.after(0,lambda s=saved:self.stat_vars['ledgers'].set(str(s)))
                 self.log_append(f'Ledgers saved: {saved}','ok' if res.get('ok') else 'error')
                 if not res.get('ok'): self.log_append(f'  └ {res.get("error")}','error')
             else:
                 self.log_append('No ledger data from Tally','warn')
             if self.stop_flag: raise Exception('Stopped')
             time.sleep(1.1)
-            self._progress(20,'Ledgers done.')
+            self._co_progress(company_name, 20, 'Ledgers done.')
 
-            # ── 2. Stock (20→35%)
-            self._progress(22,'Fetching stock items from Tally…')
+            # ── 2. Stock ─────────────────────────────────────────────────────
+            self._co_progress(company_name, 22, 'Fetching stock…')
             xml = fetch_stock(host, company=company or '')
             self.log_append(f'Stock: {len(xml):,} bytes from Tally','dim')
             if '<STOCKITEM' in xml.upper():
-                self._progress(28,'Sending stock items to server…')
+                self._co_progress(company_name, 28, 'Sending stock…')
                 bundle = build_bundle(uid,'stock',xml)
                 res    = send_bundle(srv,uid,key,bundle,cmp_,enc_,sec)
                 saved  = res.get('saved',0) if res.get('ok') else 0
-                self.root.after(0,lambda s=saved:self.stat_vars['stock'].set(str(s)))
                 self.log_append(f'Stock saved: {saved}','ok' if res.get('ok') else 'error')
                 if not res.get('ok'): self.log_append(f'  └ {res.get("error")}','error')
             else:
                 self.log_append('No stock data from Tally (F11 → Enable Inventory)','warn')
             if self.stop_flag: raise Exception('Stopped')
             time.sleep(1.1)
-            self._progress(35,'Stock done.')
+            self._co_progress(company_name, 35, 'Stock done.')
 
-            # ── 3. Vouchers ──────────────────────────────────────────────
-            # First check (locally, from config.ini): has this company been
-            # synced before? alterid_key holds the highest ALTERID seen on
-            # the last successful sync — 0/absent means "never synced".
-            #
-            #   - Never synced  -> fetch the COMPLETE voucher history in ONE
-            #     request (date filters don't restrict Voucher collections
-            #     in Tally), then split the result into batches of
-            #     `voucher_batch_size` (default 500) and send each batch
-            #     separately — avoids server-side timeouts on huge histories.
-            #   - Already synced -> fetch only vouchers with
-            #     ALTERID > last_alterid (new AND edited vouchers, any
-            #     date), then batch-send the same way if it's large.
-            alterid_key  = ('last_voucher_alterid__' + company) if company else 'last_voucher_alterid'
-            last_alterid = int(_gcfg(alterid_key, '0') or '0')
-            batch_size   = int(_gcfg('voucher_batch_size', '500') or '500')
-
-            total_fetched = 0
-            total_saved   = 0
+            # ── 3. Vouchers ──────────────────────────────────────────────────
+            alterid_key = ('last_voucher_alterid__' + company_name) if company_name else 'last_voucher_alterid'
+            last_alterid = 0
+            if self.cfg.has_option('agent', alterid_key):
+                try: last_alterid = int(self.cfg.get('agent', alterid_key).strip() or '0')
+                except ValueError: pass
+            batch_size       = int(_gcfg('voucher_batch_size','500') or '500')
             max_alterid_seen = last_alterid
-            any_error = False
+            any_error        = False
+            total_fetched    = 0
+            total_saved      = 0
 
             def send_voucher_batches(xml, is_first_batch_clears):
-                """Split xml into batches, send each, update totals/errors.
-                Checks stop_flag between every batch so Stop responds promptly."""
                 nonlocal total_fetched, total_saved, max_alterid_seen, any_error
                 batches = split_vouchers_xml(xml, batch_size)
                 n = len(batches)
                 if n > 1:
                     self.log_append(f'Sending in {n} batches of up to {batch_size} vouchers...', 'info')
                 for bi, bxml in enumerate(batches):
-                    # ── Stop check between batches ──────────────────────────
                     if self.stop_flag:
-                        self.log_append(f'Stopped after batch {bi}/{n} — watermark NOT advanced '
-                                        f'(will retry same range next sync).', 'warn')
-                        any_error = True   # prevents watermark from advancing
+                        self.log_append(f'Stopped after batch {bi}/{n} — watermark NOT advanced.', 'warn')
+                        any_error = True
                         return
                     pct = 40 + int(50 * (bi + 1) / n)
-                    self._progress(pct, f'Sending voucher batch {bi+1}/{n}...')
-                    bn = count_vouchers(bxml)
+                    self._co_progress(company_name, pct, f'Vouchers {bi+1}/{n}…')
+                    bn       = count_vouchers(bxml)
                     is_first = '1' if (is_first_batch_clears and bi == 0) else '0'
-                    bundle = build_bundle(uid, 'vouchers', bxml, meta={'from_date':'', 'to_date':''})
-                    res = send_bundle(srv, uid, key, bundle, cmp_, enc_, sec, extra={'is_first':is_first})
-                    saved   = res.get('saved', 0) if res.get('ok') else 0
-                    fetched = res.get('fetched', bn)
+                    bundle   = build_bundle(uid, 'vouchers', bxml, meta={'from_date':'', 'to_date':''})
+                    res      = send_bundle(srv, uid, key, bundle, cmp_, enc_, sec, extra={'is_first':is_first})
+                    saved    = res.get('saved', 0) if res.get('ok') else 0
+                    fetched  = res.get('fetched', bn)
                     total_fetched += fetched
                     total_saved   += saved
                     label = f'Batch {bi+1}/{n}' if n > 1 else 'Vouchers'
                     self.log_append(f'{label} ({bn} vouchers) — fetched:{fetched} saved:{saved}',
-                                     'ok' if res.get('ok') else 'error')
+                                    'ok' if res.get('ok') else 'error')
                     if res.get('error'):
                         self.log_append(f'  -> {res.get("error")}', 'warn')
                         any_error = True
@@ -1118,99 +1131,90 @@ class TallySyncApp:
                     max_alterid_seen = max(max_alterid_seen, extract_max_alterid(xml))
 
             if last_alterid > 0:
-                # ── Already synced before — quick incremental check ──
                 if self.stop_flag: raise Exception('Stopped')
-                self._progress(40, f'Checking for new/edited vouchers (AlterID > {last_alterid})...')
-                self.log_append(f'Already synced (AlterID watermark {last_alterid}) — '
-                                 f'checking for new or edited vouchers only...', 'info')
+                self._co_progress(company_name, 40, 'Checking changes…')
+                self.log_append(f'Already synced (AlterID {last_alterid}) — checking for new/edited vouchers...', 'info')
                 xml = fetch_vouchers_by_alterid(host, last_alterid, company=company or '')
                 if '<LINEERROR>' in xml.upper():
                     err_m = re.search(r'<LINEERROR>(.*?)</LINEERROR>', xml, re.I | re.S)
-                    self.log_append(f'Tally TDL error: {(err_m.group(1) if err_m else xml[:200]).strip()}', 'error')
+                    self.log_append(f'Tally error: {(err_m.group(1) if err_m else xml[:200]).strip()}', 'error')
                 vch_count = count_vouchers(xml)
-
                 if vch_count > 0:
                     self.log_append(f'{vch_count} new/edited voucher(s) found', 'info')
                     send_voucher_batches(xml, is_first_batch_clears=False)
                 else:
                     self.log_append('No new or edited vouchers since last sync.', 'dim')
-                    self._progress(90, 'No voucher changes.')
-
+                    self._co_progress(company_name, 90, 'No changes.')
             else:
-                # ── First sync for this company — fetch everything once ──
-                # Note: the Tally HTTP fetch itself (up to 30 min) is a blocking
-                # urllib call and cannot be cancelled mid-flight. Stop clicked
-                # DURING the Tally fetch will take effect immediately AFTER it
-                # returns (before any data is sent to the server).
                 if self.stop_flag: raise Exception('Stopped')
-                self._progress(40, 'Fetching complete voucher history from Tally '
-                                    '(may take a few minutes for large companies)...')
-                self.log_append('First sync for this company — fetching the complete '
-                                 'voucher history (one-time; please wait)...', 'info')
-                self.log_append('⚠  Stop will take effect after Tally responds '
-                                 '(before anything is sent to the server).', 'dim')
+                self._co_progress(company_name, 40, 'Fetching all vouchers…')
+                self.log_append('First sync — fetching complete voucher history (please wait)...', 'info')
+                self.log_append('⚠  Stop takes effect after Tally responds.', 'dim')
                 xml = fetch_all_vouchers_unfiltered(host, company=company or '', timeout=1800)
-                # Check stop immediately after the long Tally call returns
                 if self.stop_flag:
-                    self.log_append('Stopped — Tally data received but NOT sent to server.', 'warn')
+                    self.log_append('Stopped — data received but NOT sent to server.', 'warn')
                     raise Exception('Stopped')
                 if '<LINEERROR>' in xml.upper():
                     err_m = re.search(r'<LINEERROR>(.*?)</LINEERROR>', xml, re.I | re.S)
-                    self.log_append(f'Tally TDL error: {(err_m.group(1) if err_m else xml[:200]).strip()}', 'error')
-
+                    self.log_append(f'Tally error: {(err_m.group(1) if err_m else xml[:200]).strip()}', 'error')
                 vch_count = count_vouchers(xml)
                 dmin, dmax = extract_date_range(xml)
-                if dmin and dmax:
-                    self.log_append(f'Found {vch_count} voucher(s) spanning {dmin} to {dmax}', 'info')
-                else:
-                    self.log_append(f'Found {vch_count} voucher(s)', 'info')
-
+                self.log_append(
+                    f'{vch_count} voucher(s)' +
+                    (f' spanning {dmin} to {dmax}' if dmin and dmax else ''), 'info')
                 if vch_count > 0:
                     send_voucher_batches(xml, is_first_batch_clears=True)
                 else:
-                    # Still send once (is_first=1) so the server clears any
-                    # stale voucher data for this company.
-                    self.log_append('No vouchers found in Tally for this company.', 'warn')
+                    self.log_append('No vouchers found in Tally.', 'warn')
                     bundle = build_bundle(uid, 'vouchers', xml, meta={'from_date':'', 'to_date':''})
                     res = send_bundle(srv, uid, key, bundle, cmp_, enc_, sec, extra={'is_first':'1'})
                     if res.get('error'):
                         self.log_append(f'  -> {res.get("error")}', 'warn')
                         any_error = True
 
-            self.root.after(0, lambda s=total_saved: self.stat_vars['vouchers'].set(str(s)))
             self.log_append(f'Vouchers total — fetched:{total_fetched} saved:{total_saved}',
-                             'ok' if not any_error else 'warn')
-
-            # Persist the new AlterID watermark only if nothing failed —
-            # a failed sync retries the same range on the next run.
+                            'ok' if not any_error else 'warn')
             if not any_error:
                 if not self.cfg.has_section('agent'): self.cfg.add_section('agent')
                 self.cfg.set('agent', alterid_key, str(max_alterid_seen))
                 save_cfg(self.cfg)
 
-            self._progress(100,'Sync complete ✓')
+            self._co_progress(company_name, 100, 'Done ✓')
             now = datetime.now().strftime('%d %b %Y, %H:%M')
-            self.root.after(0,lambda:self.lbl_last.config(text=f'Last sync: {now}',fg='#4ade80'))
-            self.log_append('Sync complete ✓','ok')
+            self.root.after(0, lambda: self.lbl_last.config(text=f'Last sync: {now}', fg='#4ade80'))
+            self.log_append('Sync complete ✓', 'ok')
             self._next_sync = time.time() + self._interval_secs()
+            self.root.after(3000, lambda n=company_name: self._co_progress(n, 0, 'Idle'))
 
         except Exception as e:
-            self.log_append(f'Sync error: {e}','error')
-            self._progress(0,f'Error — {str(e)[:60]}')
-        self._sync_done()
+            self.log_append(f'Sync error: {e}', 'error')
+            self._co_progress(company_name, 0, 'Error')
 
     def _sync_done(self):
         self.syncing = False
         self.root.after(0, lambda: self.btn_sync_all.config(state='normal'))
         self.root.after(0, lambda: self.btn_stop.config(state='disabled', text='⏹  Stop'))
 
-    def _progress(self, pct, task=''):
-        self.pvar.set(pct)
-        self.root.after(0,lambda p=pct:self.lbl_pct.config(text=f'{int(p)}%'))
-        if task: self.root.after(0,lambda t=task:self.lbl_task.config(text=t))
-        self.root.update_idletasks()
+    def _co_progress(self, company_name, pct, status=''):
+        """Update the thin per-company Canvas progress bar (0–100)."""
+        p = self.co_progress.get(company_name)
+        if not p:
+            return
+        bar_w = int(p['width'] * max(0, min(100, pct)) / 100)
+        color = '#4ade80' if pct >= 100 else '#f87171' if status.lower().startswith('error') else '#1464f4'
+        def _update(bar_w=bar_w, color=color, status=status):
+            try:
+                p['canvas'].coords(p['fill'], 0, 0, bar_w, 5)
+                p['canvas'].itemconfig(p['fill'], fill=color)
+                if status:
+                    p['status'].set(status)
+            except Exception:
+                pass
+        self.root.after(0, _update)
 
-    # ── TEST SERVER ───────────────────────────────────────────────────────────
+    def _progress(self, pct, task=''):
+        pass  # removed — per-company bars replace this
+
 
     def _test_server(self):
         threading.Thread(target=self._do_test_server, daemon=True).start()
