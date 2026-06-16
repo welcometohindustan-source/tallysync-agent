@@ -528,17 +528,15 @@ class TallySyncApp:
 
     def _build_ui(self):
         self.root.title('TallySync Mobile — Sync Agent')
-        self.root.geometry('600x700')
+        self.root.geometry('600x530')   # shorter — no log panel
         self.root.resizable(False, False)
         self.root.configure(bg='#f0f4f8')
         self.root.protocol('WM_DELETE_WINDOW', self._on_close)
         set_window_icon(self.root)
 
-        # Header — show logo if available
+        # Header
         hdr = tk.Frame(self.root, bg='#0f1923', height=60)
         hdr.pack(fill='x'); hdr.pack_propagate(False)
-
-        # Try to load logo image for header
         self._logo_img = load_logo_image(size=(36,36))
         if self._logo_img:
             tk.Label(hdr, image=self._logo_img, bg='#0f1923').pack(side='left', padx=(14,6), pady=10)
@@ -565,7 +563,7 @@ class TallySyncApp:
         content = tk.Frame(self.root, bg='#f0f4f8')
         content.pack(fill='both', expand=True, padx=14, pady=10)
 
-        # ── Company card
+        # ── Company card ─────────────────────────────────────────────────────
         self._card(content, '📋  Tally Companies', 'company')
         self.co_frame = tk.Frame(self.company_body, bg='white')
         self.co_frame.pack(fill='x', padx=2, pady=2)
@@ -576,36 +574,29 @@ class TallySyncApp:
 
         btn_row = tk.Frame(self.company_body, bg='white')
         btn_row.pack(fill='x', padx=10, pady=(4,10))
-        self.btn_connect  = self._btn(btn_row,'🔌  Connect', self._connect,  'light')
+
+        self.btn_connect  = self._btn(btn_row, '🔌  Connect',   self._connect,       'light')
         self.btn_connect.pack(side='left', padx=(0,6))
-        self.btn_sync_all = self._btn(btn_row,'▶  Sync Now', self._sync_all, 'primary')
+
+        # Label starts as "Sync Now"; _render_companies updates it to "Sync All"
+        # when more than one company is listed.
+        self.btn_sync_all = self._btn(btn_row, '▶  Sync Now',  self._sync_all,      'primary')
         self.btn_sync_all.pack(side='left')
-        self.btn_stop     = self._btn(btn_row,'⏹  Stop', self._stop, 'danger')
+
+        self.btn_stop     = self._btn(btn_row, '⏹  Stop',      self._stop,          'danger')
         self.btn_stop.pack(side='left', padx=(6,0))
         self.btn_stop.config(state='disabled')
-        self.btn_pause    = self._btn(btn_row,'⏸  Pause', self._toggle_pause, 'light')
+
+        self.btn_pause    = self._btn(btn_row, '⏸  Pause',     self._toggle_pause,  'light')
         self.btn_pause.pack(side='left', padx=(6,0))
-        self.btn_settings = self._btn(btn_row,'⚙  Settings', self._open_settings, 'light')
+
+        self.btn_settings = self._btn(btn_row, '⚙  Settings',  self._open_settings, 'light')
         self.btn_settings.pack(side='right', padx=(6,0))
-        self.btn_test     = self._btn(btn_row,'🔍  Test', self._test_server, 'light')
+
+        self.btn_test     = self._btn(btn_row, '🔍  Test',      self._test_server,   'light')
         self.btn_test.pack(side='right')
 
-        # Interval selector row
-        irow = tk.Frame(self.company_body, bg='white')
-        irow.pack(fill='x', padx=10, pady=(0,8))
-        tk.Label(irow, text='Auto-sync interval:', bg='white', fg='#6b7280',
-                 font=('Segoe UI',9)).pack(side='left', padx=(0,6))
-        _iv = self.cfg.get('agent','interval_min').strip() if self.cfg.has_option('agent','interval_min') else '5'
-        self.interval_var = tk.StringVar(value=_iv)
-        interval_cb = ttk.Combobox(irow, textvariable=self.interval_var,
-                                    values=['5','10','20','30','45','60'],
-                                    width=5, state='readonly', font=('Segoe UI',9))
-        interval_cb.pack(side='left')
-        interval_cb.bind('<<ComboboxSelected>>', self._on_interval_change)
-        tk.Label(irow, text='minutes', bg='white', fg='#6b7280',
-                 font=('Segoe UI',9)).pack(side='left', padx=(4,0))
-
-        # ── Progress card
+        # ── Progress card ────────────────────────────────────────────────────
         self._card(content, '📊  Sync Progress', 'progress')
         self.lbl_task = tk.Label(self.progress_body, text='Idle — waiting for next sync',
             bg='white', fg='#374151', font=('Segoe UI',10), anchor='w')
@@ -632,29 +623,18 @@ class TallySyncApp:
             v=tk.StringVar(value='—'); self.stat_vars[k]=v
             tk.Label(f,textvariable=v,bg='#f8fafc',fg='#111827',font=('Segoe UI',14,'bold')).pack(pady=(2,6))
 
-        # ── Log card
-        self._card(content, '📝  Log', 'log')
-        lsf = tk.Frame(self.log_body, bg='#0f1923'); lsf.pack(fill='both', padx=1, pady=1)
-        scr = tk.Scrollbar(lsf, bg='#1d2939', troughcolor='#0f1923', relief='flat', bd=0)
-        scr.pack(side='right', fill='y')
-        self.log_txt = tk.Text(lsf, height=9, font=('Consolas',9), bg='#0f1923', fg='#a8c4e0',
-                                relief='flat', bd=0, wrap='word', state='disabled',
-                                yscrollcommand=scr.set)
-        self.log_txt.pack(side='left', fill='both', expand=True)
-        scr.config(command=self.log_txt.yview)
-        for tag,col in [('ok','#4ade80'),('error','#f87171'),('info','#93c5fd'),
-                         ('dim','#6b7280'),('warn','#fcd34d')]:
-            self.log_txt.tag_config(tag, foreground=col)
-        ltb = tk.Frame(self.log_body, bg='white'); ltb.pack(fill='x', padx=8, pady=(4,6))
-        self._btn(ltb,'🗑 Clear', self._clear_log,'light').pack(side='left')
-        self._btn(ltb,'📋 Copy log', self._copy_log,'light').pack(side='left',padx=6)
-        self.lbl_lines = tk.Label(ltb,text='',bg='white',fg='#9ca3af',font=('Segoe UI',8))
-        self.lbl_lines.pack(side='right')
-
-        # Countdown
+        # ── Countdown ────────────────────────────────────────────────────────
         self.lbl_next = tk.Label(self.root, text='', bg='#f0f4f8', fg='#9ca3af',
                                   font=('Segoe UI',8))
-        self.lbl_next.pack(pady=(0,4))
+        self.lbl_next.pack(pady=(0,2))
+
+        # ── Footer bar ───────────────────────────────────────────────────────
+        footer = tk.Frame(self.root, bg='#e5e7eb', height=24)
+        footer.pack(fill='x', side='bottom'); footer.pack_propagate(False)
+        tk.Label(footer, text='For help mail to: rajsys.mtr@gmail.com',
+                 bg='#e5e7eb', fg='#6b7280', font=('Segoe UI', 8)).pack(side='left', padx=10)
+        tk.Label(footer, text='Designed by Raj Systems & Technologies',
+                 bg='#e5e7eb', fg='#6b7280', font=('Segoe UI', 8)).pack(side='right', padx=10)
 
     def _card(self, parent, title, key):
         f=tk.Frame(parent,bg='white',bd=1,relief='flat',highlightthickness=1,
@@ -726,7 +706,7 @@ class TallySyncApp:
             return
         win = tk.Toplevel(self.root)
         win.title('TallySync — Settings')
-        win.geometry('440x420')
+        win.geometry('440x460')
         win.resizable(False, False)
         win.configure(bg='#f0f4f8')
         win.grab_set()
@@ -768,6 +748,21 @@ class TallySyncApp:
             ent.pack(side='left', fill='x', expand=True)
             svars[key] = var
 
+        # ── Auto-sync interval (moved here from main window) ─────────────────
+        irow = tk.Frame(body, bg='#f0f4f8')
+        irow.pack(fill='x', pady=3)
+        tk.Label(irow, text='Sync Interval', bg='#f0f4f8', fg='#374151',
+                 font=('Segoe UI',9,'bold'), width=12, anchor='e').pack(side='left', padx=(0,8))
+        _iv = self.cfg.get('agent','interval_min').strip() if self.cfg.has_option('agent','interval_min') else '5'
+        self.interval_var = tk.StringVar(value=_iv)
+        interval_cb = ttk.Combobox(irow, textvariable=self.interval_var,
+                                    values=['5','10','20','30','45','60'],
+                                    width=6, state='readonly', font=('Segoe UI',10))
+        interval_cb.pack(side='left')
+        interval_cb.bind('<<ComboboxSelected>>', self._on_interval_change)
+        tk.Label(irow, text='minutes', bg='#f0f4f8', fg='#6b7280',
+                 font=('Segoe UI',9)).pack(side='left', padx=(6,0))
+
         def save_settings():
             if not self.cfg.has_section('agent'):
                 self.cfg.add_section('agent')
@@ -775,6 +770,11 @@ class TallySyncApp:
                 val = var.get().strip()
                 if val:
                     self.cfg.set('agent', key, val)
+            # Save interval from the combobox added in this window
+            interval_val = self.interval_var.get().strip()
+            if interval_val:
+                self.cfg.set('agent', 'interval_min', interval_val)
+                self._next_sync = time.time() + self._interval_secs()
             save_cfg(self.cfg)
             self.cfg = load_cfg()
             lbl_ok.config(text='Saved successfully')
@@ -927,8 +927,13 @@ class TallySyncApp:
         for w in self.co_frame.winfo_children(): w.destroy()
 
         assigned_names = {a['name'] for a in self.assigned}
-        # Match Tally's discovered companies against the portal's assigned list
-        tally_names = {co['name'] for co in self.companies}
+        tally_names    = {co['name'] for co in self.companies}
+
+        # Rename the main button based on how many companies are assigned
+        if len(self.assigned) > 1:
+            self.btn_sync_all.config(text='▶  Sync All')
+        else:
+            self.btn_sync_all.config(text='▶  Sync Now')
 
         if self.assigned:
             for a in self.assigned:
@@ -971,8 +976,12 @@ class TallySyncApp:
         threading.Thread(target=self._do_sync, daemon=True).start()
 
     def _stop(self):
+        if not self.syncing:
+            return
         self.stop_flag = True
-        self.log_append('Stop requested…', 'warn')
+        self.log_append('Stop requested — will halt after current operation…', 'warn')
+        self._progress(0, 'Stopping…')
+        self.root.after(0, lambda: self.btn_stop.config(state='disabled', text='⏹  Stopping…'))
 
     def _do_sync(self, company=None):
         if self.syncing: return
@@ -1075,13 +1084,20 @@ class TallySyncApp:
             any_error = False
 
             def send_voucher_batches(xml, is_first_batch_clears):
-                """Split xml into batches, send each, update totals/errors."""
+                """Split xml into batches, send each, update totals/errors.
+                Checks stop_flag between every batch so Stop responds promptly."""
                 nonlocal total_fetched, total_saved, max_alterid_seen, any_error
                 batches = split_vouchers_xml(xml, batch_size)
                 n = len(batches)
                 if n > 1:
                     self.log_append(f'Sending in {n} batches of up to {batch_size} vouchers...', 'info')
                 for bi, bxml in enumerate(batches):
+                    # ── Stop check between batches ──────────────────────────
+                    if self.stop_flag:
+                        self.log_append(f'Stopped after batch {bi}/{n} — watermark NOT advanced '
+                                        f'(will retry same range next sync).', 'warn')
+                        any_error = True   # prevents watermark from advancing
+                        return
                     pct = 40 + int(50 * (bi + 1) / n)
                     self._progress(pct, f'Sending voucher batch {bi+1}/{n}...')
                     bn = count_vouchers(bxml)
@@ -1103,6 +1119,7 @@ class TallySyncApp:
 
             if last_alterid > 0:
                 # ── Already synced before — quick incremental check ──
+                if self.stop_flag: raise Exception('Stopped')
                 self._progress(40, f'Checking for new/edited vouchers (AlterID > {last_alterid})...')
                 self.log_append(f'Already synced (AlterID watermark {last_alterid}) — '
                                  f'checking for new or edited vouchers only...', 'info')
@@ -1121,11 +1138,22 @@ class TallySyncApp:
 
             else:
                 # ── First sync for this company — fetch everything once ──
+                # Note: the Tally HTTP fetch itself (up to 30 min) is a blocking
+                # urllib call and cannot be cancelled mid-flight. Stop clicked
+                # DURING the Tally fetch will take effect immediately AFTER it
+                # returns (before any data is sent to the server).
+                if self.stop_flag: raise Exception('Stopped')
                 self._progress(40, 'Fetching complete voucher history from Tally '
                                     '(may take a few minutes for large companies)...')
                 self.log_append('First sync for this company — fetching the complete '
                                  'voucher history (one-time; please wait)...', 'info')
+                self.log_append('⚠  Stop will take effect after Tally responds '
+                                 '(before anything is sent to the server).', 'dim')
                 xml = fetch_all_vouchers_unfiltered(host, company=company or '', timeout=1800)
+                # Check stop immediately after the long Tally call returns
+                if self.stop_flag:
+                    self.log_append('Stopped — Tally data received but NOT sent to server.', 'warn')
+                    raise Exception('Stopped')
                 if '<LINEERROR>' in xml.upper():
                     err_m = re.search(r'<LINEERROR>(.*?)</LINEERROR>', xml, re.I | re.S)
                     self.log_append(f'Tally TDL error: {(err_m.group(1) if err_m else xml[:200]).strip()}', 'error')
@@ -1172,9 +1200,9 @@ class TallySyncApp:
         self._sync_done()
 
     def _sync_done(self):
-        self.syncing=False
-        self.root.after(0,lambda:self.btn_sync_all.config(state='normal'))
-        self.root.after(0,lambda:self.btn_stop.config(state='disabled'))
+        self.syncing = False
+        self.root.after(0, lambda: self.btn_sync_all.config(state='normal'))
+        self.root.after(0, lambda: self.btn_stop.config(state='disabled', text='⏹  Stop'))
 
     def _progress(self, pct, task=''):
         self.pvar.set(pct)
@@ -1208,27 +1236,21 @@ class TallySyncApp:
         except Exception as e:
             self.log_append(f'Server test failed: {e}','error')
 
-    # ── LOG ───────────────────────────────────────────────────────────────────
+    # ── LOG (file only — no in-window panel) ─────────────────────────────────
 
     def log_append(self, msg, tag='info'):
-        ts=datetime.now().strftime('%H:%M:%S')
-        self.log_txt.config(state='normal')
-        self.log_txt.insert('end',f'{ts}  {msg}\n',tag)
-        self.log_txt.see('end')
-        self.log_txt.config(state='disabled')
-        lines=int(self.log_txt.index('end-1c').split('.')[0])
-        self.lbl_lines.config(text=f'{lines} lines')
-        log.info(msg)
+        """Write a log line to the rotating log file and Python logger.
+        The in-window log panel was removed in Phase 4 — all history lives
+        in:  %APPDATA%\\TallySync\\tallysync_agent.log"""
+        level = {'ok': logging.INFO, 'error': logging.ERROR,
+                 'warn': logging.WARNING, 'dim': logging.DEBUG}.get(tag, logging.INFO)
+        log.log(level, msg)
 
     def _clear_log(self):
-        self.log_txt.config(state='normal'); self.log_txt.delete('1.0','end')
-        self.log_txt.config(state='disabled'); self.lbl_lines.config(text='')
+        pass  # no-op — log panel removed
 
     def _copy_log(self):
-        self.root.clipboard_clear()
-        self.root.clipboard_append(self.log_txt.get('1.0','end'))
-        self.lbl_lines.config(text='✓ Copied')
-        self.root.after(2000,lambda:self.lbl_lines.config(text=''))
+        pass  # no-op — log panel removed
 
     def _on_close(self):
         """Minimize to taskbar instead of closing."""
