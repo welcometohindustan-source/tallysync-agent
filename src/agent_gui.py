@@ -528,13 +528,21 @@ class TallySyncApp:
 
     def _build_ui(self):
         self.root.title('TallySync Mobile — Sync Agent')
-        self.root.geometry('600x420')
-        self.root.resizable(False, False)
+        self.root.resizable(False, True)          # height flexible, width fixed
         self.root.configure(bg='#f0f4f8')
         self.root.protocol('WM_DELETE_WINDOW', self._on_close)
         set_window_icon(self.root)
 
-        # ── Footer (packed FIRST so it's reserved before expand takes over) ──
+        # Clamp window height to screen height after idle (content drives height)
+        def _fit_height():
+            self.root.update_idletasks()
+            max_h = self.root.winfo_screenheight() - 60   # leave taskbar room
+            cur_h = self.root.winfo_reqheight()
+            new_h = min(max(380, cur_h), max_h)
+            self.root.geometry(f'600x{new_h}')
+        self.root.after(200, _fit_height)
+
+        # ── Footer — pack FIRST so it is always visible ───────────────────────
         footer = tk.Frame(self.root, bg='#e5e7eb', height=24)
         footer.pack(fill='x', side='bottom')
         footer.pack_propagate(False)
@@ -542,6 +550,31 @@ class TallySyncApp:
                  bg='#e5e7eb', fg='#6b7280', font=('Segoe UI', 8)).pack(side='left', padx=10)
         tk.Label(footer, text='Designed by Raj Systems & Technologies',
                  bg='#e5e7eb', fg='#6b7280', font=('Segoe UI', 8)).pack(side='right', padx=10)
+
+        # ── Sticky button row — pack SECOND (above footer, always visible) ────
+        btn_outer = tk.Frame(self.root, bg='white',
+                             highlightthickness=1, highlightbackground='#e5e7eb')
+        btn_outer.pack(fill='x', side='bottom')
+        btn_row = tk.Frame(btn_outer, bg='white')
+        btn_row.pack(fill='x', padx=10, pady=8)
+        self.btn_connect  = self._btn(btn_row, '🔌  Connect',  self._connect,      'light')
+        self.btn_connect.pack(side='left', padx=(0,6))
+        self.btn_sync_all = self._btn(btn_row, '▶  Sync Now', self._sync_all,     'primary')
+        self.btn_sync_all.pack(side='left')
+        self.btn_stop     = self._btn(btn_row, '⏹  Stop',     self._stop,         'danger')
+        self.btn_stop.pack(side='left', padx=(6,0))
+        self.btn_stop.config(state='disabled')
+        self.btn_pause    = self._btn(btn_row, '⏸  Pause',    self._toggle_pause, 'light')
+        self.btn_pause.pack(side='left', padx=(6,0))
+        self.btn_settings = self._btn(btn_row, '⚙  Settings', self._open_settings,'light')
+        self.btn_settings.pack(side='right')
+
+        # ── Countdown — above button row, below companies ─────────────────────
+        self.lbl_next = tk.Frame(self.root, bg='#f0f4f8', height=20)
+        self.lbl_next_lbl = tk.Label(self.lbl_next, text='', bg='#f0f4f8',
+                                      fg='#9ca3af', font=('Segoe UI',8))
+        self.lbl_next_lbl.pack(pady=2)
+        self.lbl_next.pack(fill='x', side='bottom')
 
         # ── Header ───────────────────────────────────────────────────────────
         hdr = tk.Frame(self.root, bg='#0f1923', height=60)
@@ -569,43 +602,55 @@ class TallySyncApp:
                                   font=('Segoe UI',9))
         self.lbl_last.pack(side='right', padx=14)
 
-        # ── Scrollable content area ───────────────────────────────────────────
-        content = tk.Frame(self.root, bg='#f0f4f8')
-        content.pack(fill='both', expand=True, padx=14, pady=10)
+        # ── Company card (scrollable inner canvas) ────────────────────────────
+        card = tk.Frame(self.root, bg='white', bd=1, relief='flat',
+                        highlightthickness=1, highlightbackground='#e5e7eb')
+        card.pack(fill='both', expand=True, padx=14, pady=(10,4))
 
-        # ── Company card ─────────────────────────────────────────────────────
-        self._card(content, '📋  Tally Companies', 'company')
-        self.co_frame = tk.Frame(self.company_body, bg='white')
-        self.co_frame.pack(fill='x', padx=2, pady=2)
-        self.lbl_no_co = tk.Label(self.co_frame,
+        # Card header row — title left, sync-status label right
+        card_hdr = tk.Frame(card, bg='#f8fafc', height=32)
+        card_hdr.pack(fill='x'); card_hdr.pack_propagate(False)
+        tk.Label(card_hdr, text='📋  Tally Companies', bg='#f8fafc', fg='#111827',
+                 font=('Segoe UI',10,'bold')).pack(side='left', padx=12, pady=6)
+        self.lbl_sync_status = tk.Label(card_hdr, text='', bg='#f8fafc', fg='#1464f4',
+                                         font=('Segoe UI',9))
+        self.lbl_sync_status.pack(side='right', padx=12)
+
+        # Scrollable inner canvas for company rows
+        scroll_container = tk.Frame(card, bg='white')
+        scroll_container.pack(fill='both', expand=True)
+        self._co_canvas = tk.Canvas(scroll_container, bg='white',
+                                     highlightthickness=0, bd=0)
+        self._co_scrollbar = tk.Scrollbar(scroll_container, orient='vertical',
+                                           command=self._co_canvas.yview)
+        self._co_canvas.configure(yscrollcommand=self._co_scrollbar.set)
+        self._co_scrollbar.pack(side='right', fill='y')
+        self._co_canvas.pack(side='left', fill='both', expand=True)
+        self.co_frame = tk.Frame(self._co_canvas, bg='white')
+        self._co_frame_id = self._co_canvas.create_window((0,0), window=self.co_frame,
+                                                            anchor='nw')
+
+        def _on_co_frame_resize(e):
+            self._co_canvas.configure(scrollregion=self._co_canvas.bbox('all'))
+            self._co_canvas.itemconfig(self._co_frame_id,
+                                        width=self._co_canvas.winfo_width())
+            # Auto-fit window height to content, clamped to screen
+            self.root.after(50, _fit_height)
+        self.co_frame.bind('<Configure>', _on_co_frame_resize)
+        self._co_canvas.bind('<Configure>',
+            lambda e: self._co_canvas.itemconfig(self._co_frame_id,
+                                                   width=e.width))
+        # Mousewheel scroll
+        def _on_mousewheel(e):
+            self._co_canvas.yview_scroll(int(-1*(e.delta/120)), 'units')
+        self._co_canvas.bind_all('<MouseWheel>', _on_mousewheel)
+
+        tk.Label(self.co_frame,
             text='Click "Connect" to detect open Tally companies.',
-            bg='white', fg='#9ca3af', font=('Segoe UI',10), pady=10)
-        self.lbl_no_co.pack()
+            bg='white', fg='#9ca3af', font=('Segoe UI',10), pady=10).pack()
 
-        btn_row = tk.Frame(self.company_body, bg='white')
-        btn_row.pack(fill='x', padx=10, pady=(4,10))
-
-        self.btn_connect  = self._btn(btn_row, '🔌  Connect',   self._connect,       'light')
-        self.btn_connect.pack(side='left', padx=(0,6))
-        self.btn_sync_all = self._btn(btn_row, '▶  Sync Now',  self._sync_all,      'primary')
-        self.btn_sync_all.pack(side='left')
-        self.btn_stop     = self._btn(btn_row, '⏹  Stop',      self._stop,          'danger')
-        self.btn_stop.pack(side='left', padx=(6,0))
-        self.btn_stop.config(state='disabled')
-        self.btn_pause    = self._btn(btn_row, '⏸  Pause',     self._toggle_pause,  'light')
-        self.btn_pause.pack(side='left', padx=(6,0))
-        self.btn_settings = self._btn(btn_row, '⚙  Settings',  self._open_settings, 'light')
-        self.btn_settings.pack(side='right', padx=(6,0))
-        self.btn_test     = self._btn(btn_row, '🔍  Test',      self._test_server,   'light')
-        self.btn_test.pack(side='right')
-
-        # ── Countdown ────────────────────────────────────────────────────────
-        self.lbl_next = tk.Label(self.root, text='', bg='#f0f4f8', fg='#9ca3af',
-                                  font=('Segoe UI',8))
-        self.lbl_next.pack(pady=(0,2))
-
-        # Per-company progress bar dict — populated by _render_companies
-        self.co_progress = {}   # name → {'bar': Canvas, 'fill': int (canvas item)}
+        # Per-company progress dict populated by _render_companies
+        self.co_progress = {}
 
     def _card(self, parent, title, key):
         f=tk.Frame(parent,bg='white',bd=1,relief='flat',highlightthickness=1,
@@ -632,7 +677,7 @@ class TallySyncApp:
 
     def _tick(self):
         if self.paused:
-            self.lbl_next.config(text='Auto-sync paused ⏸')
+            self.lbl_next_lbl.config(text='Auto-sync paused ⏸')
             self.root.after(1000, self._tick)
             return
         rem = int(self._next_sync - time.time())
@@ -641,8 +686,8 @@ class TallySyncApp:
                 threading.Thread(target=self._do_sync_all_thread, daemon=True).start()
             self._next_sync = time.time() + self._interval_secs()
             rem = self._interval_secs()
-        m,s = divmod(rem,60)
-        self.lbl_next.config(text=f'Next auto-sync in {m:02d}:{s:02d}')
+        m, s = divmod(rem, 60)
+        self.lbl_next_lbl.config(text=f'Next auto-sync in {m:02d}:{s:02d}')
         self.root.after(1000, self._tick)
 
     def _toggle_pause(self):
@@ -757,7 +802,7 @@ class TallySyncApp:
                 pass  # toggle visibility if needed
 
         save_btn_row = tk.Frame(body, bg='#f0f4f8')
-        save_btn_row.pack(fill='x', pady=(12,0))
+        save_btn_row.pack(fill='x', pady=(12, 0))
         tk.Button(save_btn_row, text='💾  Save Settings',
                   bg='#1464f4', fg='white', font=('Segoe UI',10,'bold'),
                   relief='flat', cursor='hand2', padx=14, pady=8, bd=0,
@@ -765,10 +810,26 @@ class TallySyncApp:
         tk.Button(save_btn_row, text='Close',
                   bg='#f3f4f6', fg='#374151', font=('Segoe UI',10),
                   relief='flat', cursor='hand2', padx=14, pady=8, bd=0,
-                  command=win.destroy).pack(side='left', padx=(8,0))
+                  command=win.destroy).pack(side='left', padx=(8, 0))
+
+        # Test Server button — moved here from main window
+        test_row = tk.Frame(body, bg='#f0f4f8')
+        test_row.pack(fill='x', pady=(10, 0))
+        lbl_test_result = tk.Label(test_row, text='', bg='#f0f4f8',
+                                    font=('Segoe UI', 9))
+        def _run_test():
+            lbl_test_result.config(text='Testing…', fg='#6b7280')
+            win.update_idletasks()
+            self._test_server(result_label=lbl_test_result)
+        tk.Button(test_row, text='🔍  Test Server Connection',
+                  bg='#f3f4f6', fg='#374151', font=('Segoe UI',10),
+                  relief='flat', cursor='hand2', padx=14, pady=8, bd=0,
+                  command=_run_test).pack(side='left')
+        lbl_test_result.pack(side='left', padx=(10, 0))
+
         lbl_ok = tk.Label(body, text='', bg='#f0f4f8', fg='#0e9f6e',
-                          font=('Segoe UI',9))
-        lbl_ok.pack(anchor='w', pady=(6,0))
+                          font=('Segoe UI', 9))
+        lbl_ok.pack(anchor='w', pady=(6, 0))
 
         tk.Label(body,
             text='Log file: ' + str(LOG_FILE),
@@ -895,11 +956,11 @@ class TallySyncApp:
             self.root.after(0, lambda t=pretty: self.lbl_last.config(text=f'Last sync: {t}', fg='#4ade80'))
 
     def _render_companies(self):
-        for w in self.co_frame.winfo_children(): w.destroy()
+        for w in self.co_frame.winfo_children():
+            w.destroy()
         self.co_progress = {}
 
-        assigned_names = {a['name'] for a in self.assigned}
-        tally_names    = {co['name'] for co in self.companies}
+        tally_names = {co['name'] for co in self.companies}
 
         if len(self.assigned) > 1:
             self.btn_sync_all.config(text='▶  Sync All')
@@ -908,68 +969,107 @@ class TallySyncApp:
 
         if self.assigned:
             for a in self.assigned:
-                cname = a['name']
+                cname      = a['name']
+                is_open    = cname in tally_names   # is the company open in TallyPrime right now?
 
-                # Company row
+                # ── Separator ────────────────────────────────────────────────
+                sep = tk.Frame(self.co_frame, bg='#f3f4f6', height=1)
+                sep.pack(fill='x', padx=10)
+
+                # ── Main company row ─────────────────────────────────────────
                 row = tk.Frame(self.co_frame, bg='white')
-                row.pack(fill='x', padx=10, pady=(4, 0))
+                row.pack(fill='x', padx=10, pady=(6, 0))
+
                 tk.Label(row, text='🏢', bg='white',
-                         font=('Segoe UI',12)).pack(side='left', padx=(0,8))
+                         font=('Segoe UI', 12)).pack(side='left', padx=(0, 8))
+
                 inf = tk.Frame(row, bg='white')
                 inf.pack(side='left', fill='x', expand=True)
-                tk.Label(inf, text=cname, bg='white', fg='#111827',
-                         font=('Segoe UI',10,'bold'), anchor='w').pack(anchor='w')
-                if cname not in tally_names:
-                    tk.Label(inf, text='Not currently open in TallyPrime',
+
+                # Company name — grey out if not open in Tally
+                name_color = '#111827' if is_open else '#9ca3af'
+                tk.Label(inf, text=cname, bg='white', fg=name_color,
+                         font=('Segoe UI', 10, 'bold'), anchor='w').pack(anchor='w')
+
+                # Status sub-label
+                if not is_open:
+                    tk.Label(inf, text='⚠  Not open in TallyPrime — will be skipped during sync',
                              bg='white', fg='#f59e0b',
-                             font=('Segoe UI',8), anchor='w').pack(anchor='w')
+                             font=('Segoe UI', 8), anchor='w').pack(anchor='w')
 
-                co = dict(a)
-                self._btn(row, '▶ Sync Now',
-                    lambda co=co: threading.Thread(
+                # Last-sync label (reads from config.ini or portal data)
+                last_sync_text = '—'
+                last_sync_at = a.get('last_sync_at')
+                if last_sync_at:
+                    try:
+                        from datetime import datetime as _dt
+                        dt = _dt.strptime(last_sync_at, '%Y-%m-%d %H:%M:%S')
+                        last_sync_text = dt.strftime('%d %b %Y, %H:%M')
+                    except Exception:
+                        last_sync_text = last_sync_at
+                tk.Label(inf, text=f'Last sync: {last_sync_text}',
+                         bg='white', fg='#6b7280',
+                         font=('Segoe UI', 8), anchor='w').pack(anchor='w')
+
+                # Per-company Sync Now — disabled if company not open in Tally
+                co      = dict(a)
+                btn_clr = 'primary' if is_open else 'light'
+                sync_btn = self._btn(row, '▶ Sync Now',
+                    (lambda co=co: threading.Thread(
                         target=self._do_sync_one, kwargs={'company': co}, daemon=True
-                    ).start(),
-                    'primary').pack(side='right', padx=4)
+                    ).start()) if is_open else lambda: messagebox.showwarning(
+                        'Company closed',
+                        f'"{cname}" is not currently open in TallyPrime.\n'
+                        'Please open the company in Tally and try again.'),
+                    btn_clr)
+                sync_btn.pack(side='right', padx=4)
+                if not is_open:
+                    sync_btn.config(state='disabled')
 
-                # Thin progress bar — 5px tall, 240px wide, with status label
+                # ── Thin progress bar ─────────────────────────────────────────
                 bar_frame = tk.Frame(self.co_frame, bg='white')
-                bar_frame.pack(fill='x', padx=18, pady=(2, 6))
+                bar_frame.pack(fill='x', padx=18, pady=(3, 8))
                 BAR_W, BAR_H = 240, 5
                 canvas = tk.Canvas(bar_frame, width=BAR_W, height=BAR_H,
                                    bg='#e5e7eb', highlightthickness=0, bd=0)
                 canvas.pack(side='left')
-                status_var = tk.StringVar(value='Idle')
+                status_var = tk.StringVar(value='Idle' if is_open else 'Skipped — not open in Tally')
                 tk.Label(bar_frame, textvariable=status_var,
                          bg='white', fg='#9ca3af',
                          font=('Segoe UI', 8)).pack(side='left', padx=(8, 0))
-                fill_id = canvas.create_rectangle(0, 0, 0, BAR_H,
-                                                  fill='#1464f4', outline='')
+                fill_id = canvas.create_rectangle(0, 0, 0, BAR_H, fill='#1464f4', outline='')
                 self.co_progress[cname] = {
                     'canvas': canvas,
                     'fill':   fill_id,
                     'width':  BAR_W,
                     'status': status_var,
+                    'is_open': is_open,
                 }
 
+        # ── Warning note for unselected/extra companies ───────────────────────
         if self.pending_setup or (self.assigned and len(self.companies) > len(self.assigned)):
             extra = max(0, len(self.companies) - len(self.assigned))
             note  = tk.Frame(self.co_frame, bg='#fff7ed')
-            note.pack(fill='x', padx=10, pady=(8,4))
+            note.pack(fill='x', padx=10, pady=(8, 4))
             msg = ('Select which companies to sync — visit My Companies on the portal.'
                    if self.pending_setup else
-                   f'{extra} more compan{"y" if extra==1 else "ies"} found in Tally — add them on the portal (My Companies) if your plan allows.')
-            tk.Label(note, text='⚠ '+msg, bg='#fff7ed', fg='#b45309',
-                     font=('Segoe UI',9), wraplength=520, justify='left').pack(anchor='w', padx=8, pady=6)
+                   f'{extra} more compan{"y" if extra==1 else "ies"} found in Tally — '
+                   f'add them on the portal (My Companies) if your plan allows.')
+            tk.Label(note, text='⚠ ' + msg, bg='#fff7ed', fg='#b45309',
+                     font=('Segoe UI', 9), wraplength=520,
+                     justify='left').pack(anchor='w', padx=8, pady=6)
             if self.setup_url:
                 link = tk.Label(note, text=self.setup_url, bg='#fff7ed', fg='#1464f4',
-                                font=('Segoe UI',9,'underline'), cursor='hand2')
-                link.pack(anchor='w', padx=8, pady=(0,6))
-                link.bind('<Button-1>', lambda e: __import__('webbrowser').open(self.setup_url))
+                                font=('Segoe UI', 9, 'underline'), cursor='hand2')
+                link.pack(anchor='w', padx=8, pady=(0, 6))
+                link.bind('<Button-1>',
+                          lambda e: __import__('webbrowser').open(self.setup_url))
 
         if not self.assigned and not self.pending_setup and not self.companies:
-            tk.Label(self.co_frame, text='Click Connect to detect companies from TallyPrime.',
+            tk.Label(self.co_frame,
+                     text='Click Connect to detect companies from TallyPrime.',
                      bg='white', fg='#9ca3af',
-                     font=('Segoe UI',9)).pack(anchor='w', padx=10, pady=6)
+                     font=('Segoe UI', 9)).pack(anchor='w', padx=10, pady=6)
 
     # ── SYNC ─────────────────────────────────────────────────────────────────
 
@@ -981,20 +1081,25 @@ class TallySyncApp:
         threading.Thread(target=self._do_sync_all_thread, daemon=True).start()
 
     def _do_sync_all_thread(self):
-        """Worker: iterate over every assigned company and sync each one."""
+        """Worker: iterate every assigned company, skip those not open in Tally."""
         if self.syncing: return
-        self.syncing    = True
-        self.stop_flag  = False
+        self.syncing   = True
+        self.stop_flag = False
         self.root.after(0, lambda: self.btn_sync_all.config(state='disabled'))
         self.root.after(0, lambda: self.btn_stop.config(state='normal'))
         try:
-            companies_to_sync = list(self.assigned)
-            for co in companies_to_sync:
+            tally_names       = {co['name'] for co in self.companies}
+            syncable          = [co for co in self.assigned if co['name'] in tally_names]
+            total             = len(syncable)
+            for idx, co in enumerate(syncable, 1):
                 if self.stop_flag:
                     self.log_append('Sync All stopped before next company.', 'warn')
                     break
+                label = f'Syncing {idx} of {total} {"company" if total==1 else "companies"}…'
+                self.root.after(0, lambda l=label: self.lbl_sync_status.config(text=l))
                 self._sync_one_company(co)
         finally:
+            self.root.after(0, lambda: self.lbl_sync_status.config(text=''))
             self._sync_done()
 
     def _do_sync_one(self, company):
@@ -1020,33 +1125,41 @@ class TallySyncApp:
         self.root.after(0, lambda: self.btn_stop.config(state='disabled', text='⏹  Stopping…'))
 
     def _sync_one_company(self, company=None):
-        """Core sync for a single company dict. Called by both _do_sync_all_thread
-        and _do_sync_one. Updates the per-company thin progress bar."""
+        """Core sync for a single company. Skips silently if the company
+        is not currently open in TallyPrime."""
         def _gcfg(k, default=''):
             return self.cfg.get('agent', k).strip() if self.cfg.has_option('agent', k) else default
-        host = _gcfg('tally_host','http://localhost:9000')
-        srv  = _gcfg('server_url','')
+        host = _gcfg('tally_host', 'http://localhost:9000')
+        srv  = _gcfg('server_url', '')
 
         company_name = ''
         if company:
-            uid          = str(company.get('company_id',''))
-            key          = company.get('api_key','')
-            sec          = company.get('secret_key','')
-            company_name = company.get('name','')
-            self.log_append(f'Syncing "{company_name}" (company_id={uid})', 'info')
+            uid          = str(company.get('company_id', ''))
+            key          = company.get('api_key', '')
+            sec          = company.get('secret_key', '')
+            company_name = company.get('name', '')
         elif self.assigned:
             a            = self.assigned[0]
-            uid          = str(a.get('company_id',''))
-            key          = a.get('api_key','')
-            sec          = a.get('secret_key','')
-            company_name = a.get('name','')
+            uid          = str(a.get('company_id', ''))
+            key          = a.get('api_key', '')
+            sec          = a.get('secret_key', '')
+            company_name = a.get('name', '')
         else:
-            uid          = _gcfg('user_id','')
-            key          = _gcfg('api_key','')
-            sec          = _gcfg('secret_key','')
+            uid          = _gcfg('user_id', '')
+            key          = _gcfg('api_key', '')
+            sec          = _gcfg('secret_key', '')
 
-        cmp_    = _gcfg('compress','true').lower() == 'true'
-        enc_    = _gcfg('encrypt','true').lower() == 'true'
+        # ── Skip if company is not open in TallyPrime right now ──────────────
+        tally_names = {co['name'] for co in self.companies}
+        if company_name and company_name not in tally_names:
+            self.log_append(
+                f'Skipping "{company_name}" — not currently open in TallyPrime.', 'warn')
+            self._co_progress(company_name, 0, 'Skipped — not open in Tally')
+            return
+
+        self.log_append(f'Syncing "{company_name}" (company_id={uid})', 'info')
+        cmp_    = _gcfg('compress', 'true').lower() == 'true'
+        enc_    = _gcfg('encrypt',  'true').lower() == 'true'
         company = company_name
 
         if not uid or not srv:
@@ -1216,29 +1329,45 @@ class TallySyncApp:
         pass  # removed — per-company bars replace this
 
 
-    def _test_server(self):
-        threading.Thread(target=self._do_test_server, daemon=True).start()
+    def _test_server(self, result_label=None):
+        threading.Thread(target=self._do_test_server,
+                         kwargs={'result_label': result_label}, daemon=True).start()
 
-    def _do_test_server(self):
-        a   = self.cfg['agent']
-        srv = a.get('server_url','').rstrip('/')
-        uid = a.get('user_id','')
-        key = a.get('api_key','')
-        base= srv.replace('/api/ingest.php','').replace('/ingest.php','').rstrip('/')
-        url = f'{base}/api/debug.php' + (f'?uid={uid}&key={key}' if uid and key else '')
-        self.log_append(f'Testing: {url}','info')
+    def _do_test_server(self, result_label=None):
+        def _show(msg, ok=True):
+            self.log_append(msg, 'ok' if ok else 'error')
+            if result_label:
+                color = '#0e9f6e' if ok else '#e02424'
+                self.root.after(0, lambda: result_label.config(text=msg, fg=color))
+        a   = self.cfg['agent'] if self.cfg.has_section('agent') else {}
+        srv = a.get('server_url', '').rstrip('/')
+        uid = a.get('user_id', '')
+        key = a.get('api_key', '')
+        if not srv:
+            _show('No server URL configured.', ok=False); return
+        base = srv.replace('/api/ingest.php','').replace('/ingest.php','').rstrip('/')
+        url  = f'{base}/api/debug.php' + (f'?uid={uid}&key={key}' if uid and key else '')
+        self.log_append(f'Testing: {url}', 'info')
         try:
             with urllib.request.urlopen(url, timeout=10) as r:
                 data = json.loads(r.read())
-            self.log_append(f'PHP {data.get("php_version")} | DB: {"✓" if data.get("db") else "✗"} | AES-GCM: {"✓" if data.get("aes_gcm") else "✗"}','info')
+            self.log_append(
+                f'PHP {data.get("php_version")} | DB: {"✓" if data.get("db") else "✗"}'
+                f' | AES-GCM: {"✓" if data.get("aes_gcm") else "✗"}', 'info')
             if data.get('auth'):
-                u=data.get('user',{}); self.log_append(f'Auth OK — {u.get("name")} | {u.get("plan")} | {u.get("status")}','ok')
+                u = data.get('user', {})
+                self.log_append(f'Auth OK — {u.get("name")} | {u.get("plan")} | {u.get("status")}', 'ok')
             else:
-                self.log_append(f'Auth: {data.get("auth_error")}','error')
-            for w in data.get('warnings',[]): self.log_append(f'⚠ {w}','warn')
-            if data.get('ok'): self.log_append('✓ Server ready','ok')
+                self.log_append(f'Auth: {data.get("auth_error")}', 'error')
+            for w in data.get('warnings', []):
+                self.log_append(f'⚠ {w}', 'warn')
+            if data.get('ok'):
+                _show('✓ Server ready', ok=True)
+            else:
+                _show('⚠ Server responded with errors — check log file.', ok=False)
         except Exception as e:
-            self.log_append(f'Server test failed: {e}','error')
+            _show(f'✗ {str(e)[:60]}', ok=False)
+
 
     # ── LOG (file only — no in-window panel) ─────────────────────────────────
 
