@@ -1491,62 +1491,72 @@ def run_tray(app_root):
 
 
 # ── Single-instance lock ─────────────────────────────────────────────────────
-# Uses a fixed localhost TCP port as a cross-process lock. If another
-# instance already holds the port, we ask IT to show its window (via a
-# one-line message) and exit immediately instead of starting a second copy.
+# Strategy: bind a TCP port on 127.0.0.1 as a cross-process mutex.
+# IMPORTANT: do NOT set SO_REUSEADDR — that would let a second instance
+# bind the same port and defeat the lock entirely.
+# If the port is already taken, the new instance sends a SHOW command to
+# the existing one (which brings its window to front) then exits.
 SINGLE_INSTANCE_PORT = 47236
 
 def acquire_single_instance_lock():
-    """Returns a bound socket if this is the first instance, or None if
-    another instance is already running (and has been asked to show itself)."""
+    """Returns a bound listening socket if this is the first instance.
+    Returns None if another instance is already running (it has been
+    asked to show its window via a SHOW message)."""
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    # DO NOT set SO_REUSEADDR here — we want the bind to fail if another
+    # instance already holds the port.
     try:
         s.bind(('127.0.0.1', SINGLE_INSTANCE_PORT))
         s.listen(5)
         s.settimeout(0.5)
-        return s
+        return s          # we are the first (and only) instance
     except OSError:
-        # Another instance is already running — ask it to show its window.
+        # Port already bound — another instance is running.
+        # Ask it to bring its window to front, then we exit.
         try:
             c = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            c.settimeout(1.0)
+            c.settimeout(2.0)
             c.connect(('127.0.0.1', SINGLE_INSTANCE_PORT))
             c.sendall(b'SHOW\n')
             c.close()
         except Exception:
             pass
+        finally:
+            s.close()
         return None
 
+
 def start_single_instance_listener(lock_socket, root):
-    """Background thread: on any incoming connection, bring the main
-    window to front. Runs for the lifetime of the app."""
+    """Background thread: on any incoming 'SHOW' connection, bring the
+    main window to front. Runs for the lifetime of the app."""
     def _listen():
         while True:
             try:
                 conn, _addr = lock_socket.accept()
                 try:
-                    conn.recv(16)
+                    msg = conn.recv(16)
                 except Exception:
-                    pass
+                    msg = b''
                 conn.close()
-                root.after(0, _show_and_focus, root)
+                if b'SHOW' in msg:
+                    root.after(0, _show_and_focus, root)
             except socket.timeout:
                 continue
             except OSError:
-                break  # socket closed (app shutting down)
+                break   # socket was closed — app is shutting down
             except Exception:
                 continue
-    t = threading.Thread(target=_listen, daemon=True)
-    t.start()
-    return t
+    threading.Thread(target=_listen, daemon=True, name='SingleInstanceListener').start()
+
 
 def _show_and_focus(root):
+    """Bring the main window to the foreground from any thread via root.after()."""
     try:
         root.deiconify()
+        root.state('normal')
         root.lift()
         root.attributes('-topmost', True)
-        root.after(200, lambda: root.attributes('-topmost', False))
+        root.after(300, lambda: root.attributes('-topmost', False))
         root.focus_force()
     except Exception:
         pass
@@ -1683,20 +1693,45 @@ def run_once_headless():
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="TallySync Agent")
-    parser.add_argument("--tray",  action="store_true")
-    parser.add_argument("--once",  action="store_true")
-    parser.add_argument("--setup", action="store_true")
+    parser.add_argument("--tray",  action="store_true",
+                        help="Start minimised to system tray")
+    parser.add_argument("--once",  action="store_true",
+                        help="Run one headless sync then exit (Task Scheduler mode)")
+    parser.add_argument("--setup", action="store_true",
+                        help="Force the Setup Wizard even if already configured")
     args = parser.parse_args()
 
+    # ── Headless Task Scheduler mode ─────────────────────────────────────────
+    # --once must NOT show any GUI window (Task Scheduler runs as SYSTEM).
+    # Use a separate lock port so the GUI and the scheduler can coexist:
+    # the GUI holds port 47236; --once uses 47237 to prevent two scheduler
+    # jobs from overlapping each other.
     if args.once:
-        run_once_headless(); return
+        SCHED_PORT = 47237
+        sched_lock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            sched_lock.bind(('127.0.0.1', SCHED_PORT))
+        except OSError:
+            # Another --once run is already in progress — skip silently.
+            log.info("Headless sync already running — skipping this trigger.")
+            sched_lock.close()
+            return
+        try:
+            run_once_headless()
+        finally:
+            sched_lock.close()
+        return
 
-    # Single-instance check — if another GUI instance is already running,
-    # ask it to show its window and exit instead of starting a duplicate.
+    # ── GUI mode single-instance check ───────────────────────────────────────
+    # Must happen BEFORE creating any Tk window so we don't flash a blank
+    # window for a split second on a duplicate launch.
     lock_socket = acquire_single_instance_lock()
     if lock_socket is None:
-        return  # another instance is running and has been notified
+        # Another GUI instance is already running — it has been told to
+        # show its window. Just exit cleanly.
+        return
 
+    # ── Setup Wizard (first run or forced) ───────────────────────────────────
     if not is_configured() or args.setup:
         root = tk.Tk()
         SetupWindow(root)
@@ -1705,14 +1740,24 @@ def main():
             lock_socket.close()
             return
 
+    # ── Main GUI ─────────────────────────────────────────────────────────────
     root = tk.Tk()
-    app  = TallySyncApp(root)
+    app  = TallySyncApp(root)   # noqa: F841 — kept alive by mainloop
+
+    # Single-instance listener — brings window to front on a second launch.
     start_single_instance_listener(lock_socket, root)
-    threading.Thread(target=run_tray, args=(root,), daemon=True).start()
+
+    # System tray — start AFTER the main window exists so pystray references
+    # the correct root.  `--tray` launches minimised (window hidden).
     if args.tray:
-        root.withdraw()
-    root.mainloop()
-    lock_socket.close()
+        root.withdraw()   # hide before tray thread starts to avoid flash
+    threading.Thread(target=run_tray, args=(root,), daemon=True,
+                     name='TrayThread').start()
+
+    try:
+        root.mainloop()
+    finally:
+        lock_socket.close()
 
 
 if __name__ == "__main__":
