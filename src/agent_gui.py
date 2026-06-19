@@ -512,6 +512,7 @@ class TallySyncApp:
         self.pending_setup = False   # True if user must select companies on portal
         self.setup_url = ''
         self._next_sync = time.time() + self._interval_secs()
+        self._pause_remaining = 0   # seconds left on countdown when Pause was pressed
         self._settings_win = None
         self._build_ui()
         self.root.after(500, self._auto_connect)
@@ -693,11 +694,15 @@ class TallySyncApp:
     def _toggle_pause(self):
         self.paused = not self.paused
         if self.paused:
+            # Save how much time was left on the countdown
+            self._pause_remaining = max(0, int(self._next_sync - time.time()))
             self.btn_pause.config(text='▶  Resume')
-            self.log_append('Auto-sync paused. Click Resume to restart.', 'warn')
+            self.log_append('Auto-sync paused. Click Resume to continue.', 'warn')
         else:
+            # Resume: restore the remaining time so countdown picks up where it left off
             self.paused = False
-            self._next_sync = time.time() + self._interval_secs()
+            self._next_sync = time.time() + (self._pause_remaining if self._pause_remaining > 0 else self._interval_secs())
+            self._pause_remaining = 0
             self.btn_pause.config(text='⏸  Pause')
             self.log_append('Auto-sync resumed.', 'ok')
 
@@ -968,6 +973,11 @@ class TallySyncApp:
             self.btn_sync_all.config(text='▶  Sync Now')
 
         if self.assigned:
+            # Sort: open companies (in Tally right now) first, closed ones below
+            self.assigned = sorted(
+                self.assigned,
+                key=lambda a: (0 if a['name'] in tally_names else 1)
+            )
             for a in self.assigned:
                 cname      = a['name']
                 is_open    = cname in tally_names   # is the company open in TallyPrime right now?
