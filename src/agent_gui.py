@@ -599,9 +599,6 @@ class TallySyncApp:
         self.lbl_status = tk.Label(sb, text='Connecting…', bg='#1d2939', fg='#9ca3af',
                                     font=('Segoe UI',10))
         self.lbl_status.pack(side='left')
-        self.lbl_last = tk.Label(sb, text='Last sync: Never', bg='#1d2939', fg='#6b7280',
-                                  font=('Segoe UI',9))
-        self.lbl_last.pack(side='right', padx=14)
 
         # ── Company card (scrollable inner canvas) ────────────────────────────
         card = tk.Frame(self.root, bg='white', bd=1, relief='flat',
@@ -900,7 +897,8 @@ class TallySyncApp:
                 self.log_append('master_key/master_secret not set — add them to config.ini (see Sync Tally page on the portal)', 'warn')
 
             self.root.after(0, self._render_companies)
-            self._set_status(f'TallyPrime Connected  ({len(cos)} company found)', '#4ade80')
+            active_count = len([a for a in self.assigned]) if self.assigned else len(cos)
+            self._set_status(f'TallyPrime Connected  ({active_count} active company found)', '#4ade80')
             self.log_append(f'Connected — {len(cos)} company', 'ok')
         except Exception as e:
             self._set_status(f'Not connected: {str(e)[:55]}', '#f87171')
@@ -1008,7 +1006,7 @@ class TallySyncApp:
                              font=('Segoe UI', 8), anchor='w').pack(anchor='w')
 
                 # Last-sync label (reads from config.ini or portal data)
-                last_sync_text = '—'
+                last_sync_text = 'Never synced'
                 last_sync_at = a.get('last_sync_at')
                 if last_sync_at:
                     try:
@@ -1017,9 +1015,10 @@ class TallySyncApp:
                         last_sync_text = dt.strftime('%d %b %Y, %H:%M')
                     except Exception:
                         last_sync_text = last_sync_at
-                tk.Label(inf, text=f'Last sync: {last_sync_text}',
+                lbl_ls = tk.Label(inf, text=f'Last sync: {last_sync_text}',
                          bg='white', fg='#6b7280',
-                         font=('Segoe UI', 8), anchor='w').pack(anchor='w')
+                         font=('Segoe UI', 8), anchor='w')
+                lbl_ls.pack(anchor='w')
 
                 # Per-company Sync Now — disabled if company not open in Tally
                 co      = dict(a)
@@ -1054,6 +1053,7 @@ class TallySyncApp:
                     'width':  BAR_W,
                     'status': status_var,
                     'is_open': is_open,
+                    'last_sync_lbl': lbl_ls,
                 }
 
         # ── Warning note for unselected/extra companies ───────────────────────
@@ -1227,16 +1227,20 @@ class TallySyncApp:
                 nonlocal total_fetched, total_saved, max_alterid_seen, any_error
                 batches = split_vouchers_xml(xml, batch_size)
                 n = len(batches)
+                total_vch = count_vouchers(xml)   # total vouchers across all batches
                 if n > 1:
-                    self.log_append(f'Sending in {n} batches of up to {batch_size} vouchers...', 'info')
+                    self.log_append(f'Sending in {n} batches of up to {batch_size} vouchers ({total_vch} total)...', 'info')
+                sent_so_far = 0
                 for bi, bxml in enumerate(batches):
                     if self.stop_flag:
                         self.log_append(f'Stopped after batch {bi}/{n} — watermark NOT advanced.', 'warn')
                         any_error = True
                         return
+                    bn        = count_vouchers(bxml)
+                    sent_so_far += bn
                     pct = 40 + int(50 * (bi + 1) / n)
-                    self._co_progress(company_name, pct, f'Vouchers {bi+1}/{n}…')
-                    bn       = count_vouchers(bxml)
+                    # Show e.g. "500 of 1473" or "3 of 3"
+                    self._co_progress(company_name, pct, f'Vouchers {sent_so_far} of {total_vch}…')
                     is_first = '1' if (is_first_batch_clears and bi == 0) else '0'
                     bundle   = build_bundle(uid, 'vouchers', bxml, meta={'from_date':'', 'to_date':''})
                     res      = send_bundle(srv, uid, key, bundle, cmp_, enc_, sec, extra={'is_first':is_first})
@@ -1303,11 +1307,18 @@ class TallySyncApp:
                 save_cfg(self.cfg)
 
             self._co_progress(company_name, 100, 'Done ✓')
-            now = datetime.now().strftime('%d %b %Y, %H:%M')
-            self.root.after(0, lambda: self.lbl_last.config(text=f'Last sync: {now}', fg='#4ade80'))
+            now_str = datetime.now().strftime('%d %b %Y, %H:%M')
+            # Update the per-company last-sync label when bar resets to Idle
+            def _reset_to_idle(n=company_name, t=now_str):
+                self._co_progress(n, 0, 'Idle')
+                # Refresh the company list so last-sync label updates
+                p = self.co_progress.get(n)
+                if p and p.get('last_sync_lbl'):
+                    try: p['last_sync_lbl'].config(text=f'Last sync: {t}')
+                    except Exception: pass
             self.log_append('Sync complete ✓', 'ok')
             self._next_sync = time.time() + self._interval_secs()
-            self.root.after(3000, lambda n=company_name: self._co_progress(n, 0, 'Idle'))
+            self.root.after(3000, _reset_to_idle)
 
         except Exception as e:
             self.log_append(f'Sync error: {e}', 'error')
