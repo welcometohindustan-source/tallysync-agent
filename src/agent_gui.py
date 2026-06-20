@@ -34,37 +34,41 @@ def _get_logo_path(filename):
     return None
 
 def load_logo_image(size=(36,36)):
-    """Load embedded logo. Returns PhotoImage or None."""
-    p = _get_logo_path('logo.png')
-    if p:
-        try:
-            from PIL import Image, ImageTk
-            img = Image.open(p).resize(size, Image.LANCZOS)
-            return ImageTk.PhotoImage(img)
-        except Exception:
-            pass
+    """Load embedded logo — tries logo_icon.png first (no text), then logo.png."""
+    for fname in ('logo_icon.png', 'logo.png', 'logo.ico'):
+        p = _get_logo_path(fname)
+        if p:
+            try:
+                from PIL import Image, ImageTk
+                img = Image.open(str(p)).convert('RGBA').resize(size, Image.LANCZOS)
+                return ImageTk.PhotoImage(img)
+            except Exception:
+                pass
     return None
 
 def set_window_icon(root):
-    """Set window taskbar + tray icon from embedded logo.ico or logo.png."""
-    # Try .ico first (best quality on Windows)
+    """Set window taskbar + tray icon — tries .ico first, then .png."""
+    # .ico is best on Windows (multi-res, shows in taskbar + tray + Alt+Tab)
     p = _get_logo_path('logo.ico')
     if p:
         try:
-            root.iconbitmap(str(p))
+            root.iconbitmap(default=str(p))
             return
         except Exception:
             pass
-    # Fallback to .png
-    p = _get_logo_path('logo.png')
-    if p:
-        try:
-            from PIL import Image, ImageTk
-            img = Image.open(p).resize((32,32), Image.LANCZOS)
-            ico = ImageTk.PhotoImage(img)
-            root.iconphoto(True, ico)
-        except Exception:
-            pass
+    # Fallback: PNG via PIL (works in dev mode)
+    for fname in ('logo_icon.png', 'logo.png'):
+        p = _get_logo_path(fname)
+        if p:
+            try:
+                from PIL import Image, ImageTk
+                img = Image.open(str(p)).convert('RGBA').resize((32, 32), Image.LANCZOS)
+                ico = ImageTk.PhotoImage(img)
+                root.iconphoto(True, ico)
+                root._taskbar_icon_ref = ico   # prevent GC
+                return
+            except Exception:
+                pass
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 EXE_DIR = Path(sys.executable).parent if getattr(sys,'frozen',False) else Path(__file__).parent
@@ -587,17 +591,20 @@ class TallySyncApp:
         hdr = tk.Frame(self.root, bg=BLUE, height=62)
         hdr.pack(fill='x'); hdr.pack_propagate(False)
         self._logo_img = load_logo_image(size=(38, 38))
-        if self._logo_img:
-            lbl_logo = tk.Label(hdr, image=self._logo_img, bg=BLUE)
-            lbl_logo.pack(side='left', padx=(14, 8), pady=12)
+        # Load logo at larger size for header
+        self._logo_hdr_img = load_logo_image(size=(48, 48))
+        if self._logo_hdr_img:
+            lbl_logo = tk.Label(hdr, image=self._logo_hdr_img, bg=BLUE, bd=0)
+            lbl_logo.pack(side='left', padx=(12, 8), pady=7)
+            lbl_logo.image = self._logo_hdr_img  # keep reference
         else:
+            # Fallback text badge
             tk.Label(hdr, text='BV', bg=WHITE, fg=BLUE,
-                     font=('Segoe UI', 14, 'bold'), width=3, height=1,
-                     relief='flat').pack(side='left', padx=(14, 8), pady=12)
+                     font=('Segoe UI', 14, 'bold'), width=3,
+                     relief='flat').pack(side='left', padx=(12, 8), pady=7)
         tk.Label(hdr, text='BizView Pro', bg=BLUE, fg=WHITE,
                  font=('Segoe UI', 16, 'bold')).pack(side='left', pady=14)
-        tk.Label(hdr, text='Agent v4.0', bg=BLUE,
-                 fg='rgba(255,255,255,0.75)' if False else '#b3d0ff',
+        tk.Label(hdr, text='Agent v4.0', bg=BLUE, fg='#b3d0ff',
                  font=('Segoe UI', 10)).pack(side='right', padx=18)
 
         # ── Status bar (white strip below blue header) ────────────────────────
@@ -732,7 +739,7 @@ class TallySyncApp:
             self._settings_win.lift()
             return
         win = tk.Toplevel(self.root)
-        win.title('TallySync — Settings')
+        win.title('BizView Pro — Settings')
         win.geometry('440x460')
         win.resizable(False, False)
         win.configure(bg='#f0f4f8')
@@ -1425,7 +1432,7 @@ class SetupWindow:
     """Shown on first run — admin pastes the config block here."""
     def __init__(self, root):
         self.root = root
-        root.title('TallySync — First Time Setup')
+        root.title('BizView Pro — First Time Setup')
         root.geometry('480x430')
         root.resizable(False, False)
         root.configure(bg='#0f1923')
@@ -1493,7 +1500,7 @@ def run_tray(app_root):
         import pystray
         from PIL import Image, ImageDraw
         img = None
-        logo_path = _get_logo_path('logo.png')
+        logo_path = _get_logo_path('logo_icon.png') or _get_logo_path('logo.png')
         if logo_path:
             try:
                 img = Image.open(logo_path).convert('RGBA').resize((64,64), Image.LANCZOS)
@@ -1510,11 +1517,11 @@ def run_tray(app_root):
             icon.stop()
             app_root.after(0, app_root.destroy)
         menu = pystray.Menu(
-            pystray.MenuItem("Open TallySync Agent", show_win, default=True),
+            pystray.MenuItem("Open BizView Pro Agent", show_win, default=True),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Quit", quit_app),
         )
-        icon = pystray.Icon("TallySyncAgent", img, "TallySync Mobile", menu)
+        icon = pystray.Icon("BizViewPro", img, "BizView Pro — Sync Agent", menu)
         icon.run()
     except ImportError:
         pass
