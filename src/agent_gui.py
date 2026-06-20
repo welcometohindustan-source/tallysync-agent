@@ -528,126 +528,135 @@ class TallySyncApp:
     # ── BUILD UI ─────────────────────────────────────────────────────────────
 
     def _build_ui(self):
-        self.root.title('TallySync Mobile — Sync Agent')
-        self.root.resizable(False, True)          # height flexible, width fixed
-        self.root.configure(bg='#f0f4f8')
+        self.root.title('BizView Pro — Sync Agent')
+        self.root.resizable(False, True)
+        self.root.configure(bg='#f0f4f9')
         self.root.protocol('WM_DELETE_WINDOW', self._on_close)
         set_window_icon(self.root)
 
-        # Clamp window height to screen height after idle (content drives height)
+        # Colour palette — Clean White + Royal Blue
+        BLUE     = '#1464f4'
+        BLUE_DK  = '#0e50d0'
+        BG       = '#f0f4f9'
+        WHITE    = '#ffffff'
+        LINE     = '#dfe6ee'
+        INK      = '#17202a'
+        MUTED    = '#617080'
+
         def _fit_height():
             self.root.update_idletasks()
-            max_h = self.root.winfo_screenheight() - 60   # leave taskbar room
+            max_h = self.root.winfo_screenheight() - 60
             cur_h = self.root.winfo_reqheight()
-            new_h = min(max(380, cur_h), max_h)
-            self.root.geometry(f'600x{new_h}')
+            self.root.geometry(f'600x{min(max(400, cur_h), max_h)}')
         self.root.after(200, _fit_height)
 
-        # ── Footer — pack FIRST so it is always visible ───────────────────────
-        footer = tk.Frame(self.root, bg='#e5e7eb', height=24)
-        footer.pack(fill='x', side='bottom')
-        footer.pack_propagate(False)
-        tk.Label(footer, text='For help mail to: rajsys.mtr@gmail.com',
-                 bg='#e5e7eb', fg='#6b7280', font=('Segoe UI', 8)).pack(side='left', padx=10)
+        # ── Footer ────────────────────────────────────────────────────────────
+        footer = tk.Frame(self.root, bg=LINE, height=24)
+        footer.pack(fill='x', side='bottom'); footer.pack_propagate(False)
+        tk.Label(footer, text='For help: rajsys.mtr@gmail.com',
+                 bg=LINE, fg=MUTED, font=('Segoe UI', 8)).pack(side='left', padx=10)
         tk.Label(footer, text='Designed by Raj Systems & Technologies',
-                 bg='#e5e7eb', fg='#6b7280', font=('Segoe UI', 8)).pack(side='right', padx=10)
+                 bg=LINE, fg=MUTED, font=('Segoe UI', 8)).pack(side='right', padx=10)
 
-        # ── Sticky button row — pack SECOND (above footer, always visible) ────
-        btn_outer = tk.Frame(self.root, bg='white',
-                             highlightthickness=1, highlightbackground='#e5e7eb')
+        # ── Button row ────────────────────────────────────────────────────────
+        btn_outer = tk.Frame(self.root, bg=WHITE, highlightthickness=1,
+                             highlightbackground=LINE)
         btn_outer.pack(fill='x', side='bottom')
-        btn_row = tk.Frame(btn_outer, bg='white')
+        btn_row = tk.Frame(btn_outer, bg=WHITE)
         btn_row.pack(fill='x', padx=10, pady=8)
-        self.btn_connect  = self._btn(btn_row, '🔌  Connect',  self._connect,      'light')
+        self.btn_connect  = self._btn(btn_row, '🔌  Connect',   self._connect,      'light')
         self.btn_connect.pack(side='left', padx=(0,6))
-        self.btn_sync_all = self._btn(btn_row, '▶  Sync Now', self._sync_all,     'primary')
+        self.btn_sync_all = self._btn(btn_row, '▶  Sync All',   self._sync_all,    'primary')
         self.btn_sync_all.pack(side='left')
-        self.btn_stop     = self._btn(btn_row, '⏹  Stop',     self._stop,         'danger')
+        self.btn_stop     = self._btn(btn_row, '⏹  Stop',       self._stop,        'danger')
         self.btn_stop.pack(side='left', padx=(6,0))
         self.btn_stop.config(state='disabled')
-        self.btn_pause    = self._btn(btn_row, '⏸  Pause',    self._toggle_pause, 'light')
+        self.btn_pause    = self._btn(btn_row, '⏸  Pause',      self._toggle_pause,'light')
         self.btn_pause.pack(side='left', padx=(6,0))
-        self.btn_settings = self._btn(btn_row, '⚙  Settings', self._open_settings,'light')
+        self.btn_settings = self._btn(btn_row, '⚙  Settings',   self._open_settings,'light')
         self.btn_settings.pack(side='right')
 
-        # ── Countdown — above button row, below companies ─────────────────────
-        self.lbl_next = tk.Frame(self.root, bg='#f0f4f8', height=20)
-        self.lbl_next_lbl = tk.Label(self.lbl_next, text='', bg='#f0f4f8',
-                                      fg='#9ca3af', font=('Segoe UI',8))
-        self.lbl_next_lbl.pack(pady=2)
+        # ── Countdown strip ───────────────────────────────────────────────────
+        self.lbl_next = tk.Frame(self.root, bg=BG, height=22)
+        self.lbl_next_lbl = tk.Label(self.lbl_next, text='', bg=BG,
+                                      fg=MUTED, font=('Segoe UI', 8))
+        self.lbl_next_lbl.pack(pady=3)
         self.lbl_next.pack(fill='x', side='bottom')
 
-        # ── Header ───────────────────────────────────────────────────────────
-        hdr = tk.Frame(self.root, bg='#0f1923', height=60)
+        # ── Royal Blue Header ─────────────────────────────────────────────────
+        hdr = tk.Frame(self.root, bg=BLUE, height=62)
         hdr.pack(fill='x'); hdr.pack_propagate(False)
-        self._logo_img = load_logo_image(size=(36,36))
+        self._logo_img = load_logo_image(size=(38, 38))
         if self._logo_img:
-            tk.Label(hdr, image=self._logo_img, bg='#0f1923').pack(side='left', padx=(14,6), pady=10)
-            tk.Label(hdr, text='TallySync Mobile', bg='#0f1923', fg='white',
-                     font=('Segoe UI',16,'bold')).pack(side='left', pady=12)
+            lbl_logo = tk.Label(hdr, image=self._logo_img, bg=BLUE)
+            lbl_logo.pack(side='left', padx=(14, 8), pady=12)
         else:
-            tk.Label(hdr, text='⚡  TallySync Mobile', bg='#0f1923', fg='white',
-                     font=('Segoe UI',16,'bold')).pack(side='left', padx=18, pady=12)
-        tk.Label(hdr, text='Agent v4.0', bg='#0f1923', fg='#6b8cae',
-                 font=('Segoe UI',10)).pack(side='right', padx=18)
+            tk.Label(hdr, text='BV', bg=WHITE, fg=BLUE,
+                     font=('Segoe UI', 14, 'bold'), width=3, height=1,
+                     relief='flat').pack(side='left', padx=(14, 8), pady=12)
+        tk.Label(hdr, text='BizView Pro', bg=BLUE, fg=WHITE,
+                 font=('Segoe UI', 16, 'bold')).pack(side='left', pady=14)
+        tk.Label(hdr, text='Agent v4.0', bg=BLUE,
+                 fg='rgba(255,255,255,0.75)' if False else '#b3d0ff',
+                 font=('Segoe UI', 10)).pack(side='right', padx=18)
 
-        # ── Status bar ───────────────────────────────────────────────────────
-        sb = tk.Frame(self.root, bg='#1d2939', height=36)
+        # ── Status bar (white strip below blue header) ────────────────────────
+        sb = tk.Frame(self.root, bg='#eef4ff', height=34,
+                      highlightthickness=1, highlightbackground='#c7d9fe')
         sb.pack(fill='x'); sb.pack_propagate(False)
-        self.dot = tk.Label(sb, text='●', bg='#1d2939', fg='#4b5563', font=('Segoe UI',13))
-        self.dot.pack(side='left', padx=(14,4), pady=8)
-        self.lbl_status = tk.Label(sb, text='Connecting…', bg='#1d2939', fg='#9ca3af',
-                                    font=('Segoe UI',10))
+        self.dot = tk.Label(sb, text='●', bg='#eef4ff', fg='#94a3b8',
+                            font=('Segoe UI', 12))
+        self.dot.pack(side='left', padx=(14, 4), pady=8)
+        self.lbl_status = tk.Label(sb, text='Connecting…', bg='#eef4ff', fg=MUTED,
+                                    font=('Segoe UI', 10))
         self.lbl_status.pack(side='left')
 
-        # ── Company card (scrollable inner canvas) ────────────────────────────
-        card = tk.Frame(self.root, bg='white', bd=1, relief='flat',
-                        highlightthickness=1, highlightbackground='#e5e7eb')
-        card.pack(fill='both', expand=True, padx=14, pady=(10,4))
+        # ── Company card (white, rounded border) ──────────────────────────────
+        card = tk.Frame(self.root, bg=WHITE, highlightthickness=1,
+                        highlightbackground=LINE)
+        card.pack(fill='both', expand=True, padx=14, pady=(10, 4))
 
-        # Card header row — title left, sync-status label right
-        card_hdr = tk.Frame(card, bg='#f8fafc', height=32)
+        card_hdr = tk.Frame(card, bg='#f5f8ff', height=34)
         card_hdr.pack(fill='x'); card_hdr.pack_propagate(False)
-        tk.Label(card_hdr, text='📋  Tally Companies', bg='#f8fafc', fg='#111827',
-                 font=('Segoe UI',10,'bold')).pack(side='left', padx=12, pady=6)
-        self.lbl_sync_status = tk.Label(card_hdr, text='', bg='#f8fafc', fg='#1464f4',
-                                         font=('Segoe UI',9))
+        # Blue left accent bar
+        tk.Frame(card_hdr, bg=BLUE, width=4).pack(side='left', fill='y')
+        tk.Label(card_hdr, text='  Tally Companies', bg='#f5f8ff', fg=INK,
+                 font=('Segoe UI', 10, 'bold')).pack(side='left', padx=8, pady=8)
+        self.lbl_sync_status = tk.Label(card_hdr, text='', bg='#f5f8ff', fg=BLUE,
+                                         font=('Segoe UI', 9))
         self.lbl_sync_status.pack(side='right', padx=12)
 
-        # Scrollable inner canvas for company rows
-        scroll_container = tk.Frame(card, bg='white')
+        scroll_container = tk.Frame(card, bg=WHITE)
         scroll_container.pack(fill='both', expand=True)
-        self._co_canvas = tk.Canvas(scroll_container, bg='white',
+        self._co_canvas = tk.Canvas(scroll_container, bg=WHITE,
                                      highlightthickness=0, bd=0)
         self._co_scrollbar = tk.Scrollbar(scroll_container, orient='vertical',
                                            command=self._co_canvas.yview)
         self._co_canvas.configure(yscrollcommand=self._co_scrollbar.set)
         self._co_scrollbar.pack(side='right', fill='y')
         self._co_canvas.pack(side='left', fill='both', expand=True)
-        self.co_frame = tk.Frame(self._co_canvas, bg='white')
-        self._co_frame_id = self._co_canvas.create_window((0,0), window=self.co_frame,
+        self.co_frame = tk.Frame(self._co_canvas, bg=WHITE)
+        self._co_frame_id = self._co_canvas.create_window((0, 0),
+                                                            window=self.co_frame,
                                                             anchor='nw')
 
         def _on_co_frame_resize(e):
             self._co_canvas.configure(scrollregion=self._co_canvas.bbox('all'))
             self._co_canvas.itemconfig(self._co_frame_id,
                                         width=self._co_canvas.winfo_width())
-            # Auto-fit window height to content, clamped to screen
             self.root.after(50, _fit_height)
         self.co_frame.bind('<Configure>', _on_co_frame_resize)
         self._co_canvas.bind('<Configure>',
-            lambda e: self._co_canvas.itemconfig(self._co_frame_id,
-                                                   width=e.width))
-        # Mousewheel scroll
+            lambda e: self._co_canvas.itemconfig(self._co_frame_id, width=e.width))
+
         def _on_mousewheel(e):
             self._co_canvas.yview_scroll(int(-1*(e.delta/120)), 'units')
         self._co_canvas.bind_all('<MouseWheel>', _on_mousewheel)
 
         tk.Label(self.co_frame,
             text='Click "Connect" to detect open Tally companies.',
-            bg='white', fg='#9ca3af', font=('Segoe UI',10), pady=10).pack()
+            bg=WHITE, fg='#94a3b8', font=('Segoe UI', 10), pady=14).pack()
 
-        # Per-company progress dict populated by _render_companies
         self.co_progress = {}
 
     def _card(self, parent, title, key):
@@ -905,8 +914,8 @@ class TallySyncApp:
             self.log_append(f'Connect failed: {e}', 'error')
 
     def _set_status(self, msg, color):
-        self.root.after(0, lambda: self.lbl_status.config(text=msg, fg=color))
-        self.root.after(0, lambda: self.dot.config(fg=color))
+        self.root.after(0, lambda: self.lbl_status.config(text=msg, fg=color, bg='#eef4ff'))
+        self.root.after(0, lambda: self.dot.config(fg=color, bg='#eef4ff'))
 
     def _sync_watermarks_from_server(self):
         """Pull each active company's last_voucher_alterid / last_sync_at
