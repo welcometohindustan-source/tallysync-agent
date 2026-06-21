@@ -19,34 +19,16 @@ jobs:
           python-version: '3.11'
 
       - name: Install Python dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install pyinstaller cryptography pystray pillow
+        run: python -m pip install --upgrade pip && pip install pyinstaller cryptography pystray pillow
 
-      - name: Ensure logo.ico exists from logo_icon.png or logo.png
-        run: |
-          python -c "
-from PIL import Image
-import os, sys
-
-# Try logo_icon.png first (cleaner icon without text)
-for src in ['src/logo_icon.png', 'src/logo.png']:
-    if os.path.exists(src):
-        img = Image.open(src).convert('RGBA')
-        sizes = [(256,256),(128,128),(64,64),(48,48),(32,32),(24,24),(16,16)]
-        resized = [img.resize(s, Image.LANCZOS) for s in sizes]
-        resized[0].save('src/logo.ico', format='ICO', sizes=sizes, append_images=resized[1:])
-        print(f'Created logo.ico from {src}')
-        sys.exit(0)
-print('WARNING: No logo PNG found — exe will use default icon')
-"
-          if (Test-Path "src/logo.ico") { Write-Host "logo.ico ready" }
+      - name: Create logo.ico from logo_icon.png
+        run: python scripts/make_ico.py
 
       - name: Build BizViewProAgent.exe
+        shell: pwsh
         run: |
-          $args = @(
-            "--onefile",
-            "--windowed",
+          $pyArgs = @(
+            "--onefile", "--windowed",
             "--name", "BizViewProAgent",
             "--hidden-import", "tkinter",
             "--hidden-import", "tkinter.ttk",
@@ -62,71 +44,69 @@ print('WARNING: No logo PNG found — exe will use default icon')
             "--hidden-import", "PIL.ImageDraw",
             "--hidden-import", "PIL.ImageTk"
           )
-
-          # Embed all logo files so they're accessible from _MEIPASS at runtime
-          foreach ($f in @("src/logo.ico","src/logo.png","src/logo_icon.png")) {
-            if (Test-Path $f) {
-              $args += "--add-data"
-              $args += "$f;."
-              Write-Host "Embedding $f"
+          foreach ($logo in @("src/logo.ico","src/logo.png","src/logo_icon.png")) {
+            if (Test-Path $logo) {
+              $pyArgs += "--add-data"
+              $pyArgs += "${logo};."
+              Write-Host "Embedding $logo"
             }
           }
-
-          # Set .exe icon to logo.ico
           if (Test-Path "src/logo.ico") {
-            $args += "--icon"
-            $args += "src/logo.ico"
+            $pyArgs += "--icon"
+            $pyArgs += "src/logo.ico"
           }
+          $pyArgs += "src/agent_gui.py"
+          python -m PyInstaller @pyArgs
 
-          $args += "src/agent_gui.py"
-          & python -m PyInstaller @args
-
-      - name: Verify EXE
+      - name: Verify EXE built
         run: dir dist\
 
-      - name: Prepare installer folder
+      - name: Prepare installer staging folder
+        shell: pwsh
         run: |
-          # Copy exe to installer/ folder (NSIS expects it in dist/)
-          # NSIS File command uses dist\ path
-          copy dist\BizViewProAgent.exe installer\dist\BizViewProAgent.exe 2>$null || true
           New-Item -ItemType Directory -Force installer\dist | Out-Null
-          copy dist\BizViewProAgent.exe installer\dist\BizViewProAgent.exe
-          copy config.ini installer\config.ini
-
-          # Copy logos
-          foreach ($f in @("src/logo.ico","src/logo.png","src/logo_icon.png")) {
-            if (Test-Path $f) { copy $f installer\ }
+          Copy-Item dist\BizViewProAgent.exe installer\dist\BizViewProAgent.exe
+          if (Test-Path config.ini) { Copy-Item config.ini installer\config.ini }
+          foreach ($logo in @("src/logo.ico","src/logo.png","src/logo_icon.png")) {
+            if (Test-Path $logo) { Copy-Item $logo installer\ }
           }
 
       - name: Install NSIS
         run: choco install nsis -y --no-progress
 
-      - name: Build NSIS Installer
+      - name: Build NSIS installer
+        shell: pwsh
         run: |
-          $icon = ""
-          if (Test-Path "installer/logo.ico") {
-            $icon = "/DICON_FILE=logo.ico"
-            Write-Host "Building installer with BizView Pro icon"
-          }
-          $nsiPath = "installer/TallySyncSetup.nsi"
-          if ($icon) {
-            & "C:\Program Files (x86)\NSIS\makensis.exe" $icon $nsiPath
+          $nsis = "C:\Program Files (x86)\NSIS\makensis.exe"
+          $nsi  = "installer\TallySyncSetup.nsi"
+          if (Test-Path "installer\logo.ico") {
+            & $nsis "/DICON_FILE=logo.ico" $nsi
           } else {
-            & "C:\Program Files (x86)\NSIS\makensis.exe" $nsiPath
+            & $nsis $nsi
           }
 
-      - name: Rename installer output
+      - name: Rename installer to BizViewProSetup.exe
+        shell: pwsh
         run: |
-          if (Test-Path "installer/BizViewProSetup.exe") {
-            Write-Host "BizViewProSetup.exe built successfully"
-          } elseif (Test-Path "installer/TallySyncSetup.exe") {
-            Rename-Item "installer/TallySyncSetup.exe" "installer/BizViewProSetup.exe"
+          if (Test-Path "installer\TallySyncSetup.exe") {
+            Rename-Item "installer\TallySyncSetup.exe" "BizViewProSetup.exe"
+          } elseif (Test-Path "installer\BizViewProSetup.exe") {
+            Write-Host "BizViewProSetup.exe already exists"
+          } else {
+            Write-Host "ERROR: no installer exe found"; dir installer\; exit 1
           }
 
       - name: Verify installer
         run: dir installer\*.exe
 
-      - name: Upload Portable EXE
+      - name: Create installer.zip for website download
+        shell: pwsh
+        run: |
+          $items = @("installer\BizViewProSetup.exe")
+          if (Test-Path config.ini) { $items += "config.ini" }
+          Compress-Archive -Path $items -DestinationPath installer\installer.zip -Force
+
+      - name: Upload portable EXE artifact
         uses: actions/upload-artifact@v4
         with:
           name: BizViewProAgent-Portable
@@ -135,18 +115,14 @@ print('WARNING: No logo PNG found — exe will use default icon')
             config.ini
           retention-days: 30
 
-      - name: Upload Windows Installer
+      - name: Upload installer EXE artifact
         uses: actions/upload-artifact@v4
         with:
           name: BizViewProSetup-Installer
           path: installer/BizViewProSetup.exe
           retention-days: 30
 
-      - name: Create installer ZIP for website
-        run: |
-          Compress-Archive -Path installer/BizViewProSetup.exe,config.ini -DestinationPath installer/installer.zip
-
-      - name: Upload installer.zip
+      - name: Upload installer.zip artifact
         uses: actions/upload-artifact@v4
         with:
           name: installer-zip
