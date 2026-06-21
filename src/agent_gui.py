@@ -538,6 +538,47 @@ class TallySyncApp:
         self.root.protocol('WM_DELETE_WINDOW', self._on_close)
         set_window_icon(self.root)
 
+        # ── Royal Blue Windows title bar (Windows 11 / 10 build 22000+) ─────
+        def _set_title_bar_color(hwnd, r=0x14, g=0x64, b=0xf4):
+            """Use DwmSetWindowAttribute to color the title bar Royal Blue."""
+            try:
+                import ctypes
+                DWMWA_CAPTION_COLOR = 35
+                # COLORREF is 0x00BBGGRR
+                color = ctypes.c_int(b << 16 | g << 8 | r)
+                ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                    ctypes.c_void_p(hwnd),
+                    ctypes.c_uint(DWMWA_CAPTION_COLOR),
+                    ctypes.byref(color),
+                    ctypes.sizeof(color)
+                )
+                # Also set title bar text to white
+                DWMWA_TEXT_COLOR = 36
+                white = ctypes.c_int(0x00FFFFFF)
+                ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                    ctypes.c_void_p(hwnd),
+                    ctypes.c_uint(DWMWA_TEXT_COLOR),
+                    ctypes.byref(white),
+                    ctypes.sizeof(white)
+                )
+            except Exception:
+                pass  # Silently fail on older Windows / non-Windows
+
+        def _apply_title_bar_color():
+            """Must be called after window is fully created."""
+            try:
+                import ctypes
+                hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
+                if not hwnd:
+                    hwnd = self.root.winfo_id()
+                _set_title_bar_color(hwnd)
+            except Exception:
+                pass
+
+        # Apply title bar color after window renders
+        self.root.after(100, _apply_title_bar_color)
+        self.root.after(500, _apply_title_bar_color)  # retry in case first call is too early
+
         # Colour palette — Clean White + Royal Blue
         BLUE     = '#1464f4'
         BLUE_DK  = '#0e50d0'
@@ -1036,7 +1077,7 @@ class TallySyncApp:
                          font=('Segoe UI', 8), anchor='w')
                 lbl_ls.pack(anchor='w')
 
-                # Per-company Sync Now — disabled if company not open in Tally
+                # Per-company Sync Now + Full Resync buttons
                 co      = dict(a)
                 btn_clr = 'primary' if is_open else 'light'
                 sync_btn = self._btn(row, '▶ Sync Now',
@@ -1047,7 +1088,32 @@ class TallySyncApp:
                         f'"{cname}" is not currently open in TallyPrime.\n'
                         'Please open the company in Tally and try again.'),
                     btn_clr)
-                sync_btn.pack(side='right', padx=4)
+                sync_btn.pack(side='right', padx=(0,4))
+
+                # Full Resync button — clears watermark then does full re-upload
+                def _make_full_resync(co_=co, cname_=cname):
+                    def _do():
+                        if not messagebox.askyesno(
+                            'Full Resync',
+                            f'Delete all "{cname_}" data on server and re-upload from Tally?\n\n'
+                            f'• Clears local AlterID watermark\n'
+                            f'• Re-sends ALL vouchers (all years)\n'
+                            f'• May take several minutes\n\nContinue?'
+                        ): return
+                        akey = ('last_voucher_alterid__' + cname_) if cname_ else 'last_voucher_alterid'
+                        if self.cfg.has_option('agent', akey):
+                            self.cfg.set('agent', akey, '0')
+                            _save_cfg(self.cfg)
+                        self.log_append(f'[{cname_}] Full resync — AlterID cleared, starting full upload...', 'warn')
+                        threading.Thread(
+                            target=self._do_sync_one, kwargs={'company': co_}, daemon=True
+                        ).start()
+                    return _do
+
+                if is_open:
+                    self._btn(row, '↺', _make_full_resync(),
+                              'light').pack(side='right', padx=(0,2))
+
                 if not is_open:
                     sync_btn.config(state='disabled')
 
@@ -1198,16 +1264,30 @@ class TallySyncApp:
             xml = fetch_ledgers(host, company=company or '')
             self.log_append(f'Ledgers: {len(xml):,} bytes from Tally','dim')
             if '<LEDGER' in xml.upper():
-                self._co_progress(company_name, 12, 'Sending ledgers…')
-                bundle = build_bundle(uid,'ledgers',xml)
-                res    = send_bundle(srv,uid,key,bundle,cmp_,enc_,sec)
-                saved  = res.get('saved',0) if res.get('ok') else 0
-                self.log_append(f'Ledgers saved: {saved}','ok' if res.get('ok') else 'error')
-                if not res.get('ok'): self.log_append(f'  └ {res.get("error")}','error')
+                # Hash-based skip: only upload if ledger data changed since last sync
+                import hashlib
+                ledger_hash_key = 'ledger_hash__' + company_name.replace(' ','_')
+                xml_hash = hashlib.md5(xml.encode('utf-8', errors='ignore')).hexdigest()
+                cached_hash = self.cfg.get('agent', ledger_hash_key, fallback='')
+                if xml_hash == cached_hash:
+                    self.log_append('Ledgers unchanged since last sync — skipped (faster)','dim')
+                else:
+                    self._co_progress(company_name, 12, 'Sending ledgers…')
+                    bundle = build_bundle(uid,'ledgers',xml)
+                    res    = send_bundle(srv,uid,key,bundle,cmp_,enc_,sec)
+                    saved  = res.get('saved',0) if res.get('ok') else 0
+                    self.log_append(f'Ledgers saved: {saved}','ok' if res.get('ok') else 'error')
+                    if res.get('ok'):
+                        if not self.cfg.has_section('agent'):
+                            self.cfg.add_section('agent')
+                        self.cfg.set('agent', ledger_hash_key, xml_hash)
+                        _save_cfg(self.cfg)
+                    else:
+                        self.log_append(f'  └ {res.get("error")}','error')
             else:
                 self.log_append('No ledger data from Tally','warn')
             if self.stop_flag: raise Exception('Stopped')
-            time.sleep(1.1)
+            time.sleep(0.5)
             self._co_progress(company_name, 20, 'Ledgers done.')
 
             # ── 2. Stock ─────────────────────────────────────────────────────
@@ -1215,16 +1295,27 @@ class TallySyncApp:
             xml = fetch_stock(host, company=company or '')
             self.log_append(f'Stock: {len(xml):,} bytes from Tally','dim')
             if '<STOCKITEM' in xml.upper():
-                self._co_progress(company_name, 28, 'Sending stock…')
-                bundle = build_bundle(uid,'stock',xml)
-                res    = send_bundle(srv,uid,key,bundle,cmp_,enc_,sec)
-                saved  = res.get('saved',0) if res.get('ok') else 0
-                self.log_append(f'Stock saved: {saved}','ok' if res.get('ok') else 'error')
-                if not res.get('ok'): self.log_append(f'  └ {res.get("error")}','error')
+                # Hash-based skip for stock too
+                stock_hash_key = 'stock_hash__' + company_name.replace(' ','_')
+                xml_hash = hashlib.md5(xml.encode('utf-8', errors='ignore')).hexdigest()
+                cached_hash = self.cfg.get('agent', stock_hash_key, fallback='')
+                if xml_hash == cached_hash:
+                    self.log_append('Stock items unchanged since last sync — skipped (faster)','dim')
+                else:
+                    self._co_progress(company_name, 28, 'Sending stock…')
+                    bundle = build_bundle(uid,'stock',xml)
+                    res    = send_bundle(srv,uid,key,bundle,cmp_,enc_,sec)
+                    saved  = res.get('saved',0) if res.get('ok') else 0
+                    self.log_append(f'Stock saved: {saved}','ok' if res.get('ok') else 'error')
+                    if res.get('ok'):
+                        self.cfg.set('agent', stock_hash_key, xml_hash)
+                        _save_cfg(self.cfg)
+                    else:
+                        self.log_append(f'  └ {res.get("error")}','error')
             else:
                 self.log_append('No stock data from Tally (F11 → Enable Inventory)','warn')
             if self.stop_flag: raise Exception('Stopped')
-            time.sleep(1.1)
+            time.sleep(0.5)
             self._co_progress(company_name, 35, 'Stock done.')
 
             # ── 3. Vouchers ──────────────────────────────────────────────────
@@ -1276,23 +1367,49 @@ class TallySyncApp:
             if last_alterid > 0:
                 if self.stop_flag: raise Exception('Stopped')
                 self._co_progress(company_name, 40, 'Checking changes…')
-                self.log_append(f'Already synced (AlterID {last_alterid}) — checking for new/edited vouchers...', 'info')
+                self.log_append(f'Incremental sync from AlterID {last_alterid} — fetching new/edited vouchers...', 'info')
                 xml = fetch_vouchers_by_alterid(host, last_alterid, company=company or '')
                 if '<LINEERROR>' in xml.upper():
                     err_m = re.search(r'<LINEERROR>(.*?)</LINEERROR>', xml, re.I | re.S)
                     self.log_append(f'Tally error: {(err_m.group(1) if err_m else xml[:200]).strip()}', 'error')
                 vch_count = count_vouchers(xml)
                 if vch_count > 0:
-                    self.log_append(f'{vch_count} new/edited voucher(s) found', 'info')
+                    self.log_append(f'{vch_count} new/edited voucher(s) found since AlterID {last_alterid}', 'info')
                     send_voucher_batches(xml, is_first_batch_clears=False)
+
+                    # ── Also scan PREVIOUS financial years to catch old vouchers ──
+                    # This catches vouchers from companies that were synced to a
+                    # different server (localhost vs bizviewpro.in)
+                    # We check if server has vouchers for all years back to company start
+                    try:
+                        # Get earliest voucher date from server to detect missing years
+                        earliest_bundle = build_bundle(uid, 'get_earliest_date', '', meta={})
+                        earliest_res    = send_bundle(srv, uid, key, earliest_bundle, cmp_, enc_, sec)
+                        server_earliest = earliest_res.get('earliest_date', '') if earliest_res.get('ok') else ''
+                        # Get Tally's earliest voucher date
+                        tally_earliest_xml = fetch_all_vouchers_unfiltered(
+                            host, company=company or '', timeout=300,
+                            date_filter='from_start'
+                        )
+                        t_dmin, _ = extract_date_range(tally_earliest_xml)
+                        if t_dmin and server_earliest and t_dmin < server_earliest[:8].replace('-',''):
+                            # Tally has older data than server — send it
+                            self.log_append(
+                                f'Found older Tally data ({t_dmin}) not on server (server from {server_earliest}) — syncing historical data...', 'warn'
+                            )
+                            hist_count = count_vouchers(tally_earliest_xml)
+                            if hist_count > 0:
+                                send_voucher_batches(tally_earliest_xml, is_first_batch_clears=False)
+                    except Exception as e_hist:
+                        self.log_append(f'Historical check skipped: {e_hist}', 'dim')
                 else:
                     self.log_append('No new or edited vouchers since last sync.', 'dim')
                     self._co_progress(company_name, 90, 'No changes.')
             else:
                 if self.stop_flag: raise Exception('Stopped')
-                self._co_progress(company_name, 40, 'Fetching all vouchers…')
-                self.log_append('First sync — fetching complete voucher history (please wait)...', 'info')
-                self.log_append('⚠  Stop takes effect after Tally responds.', 'dim')
+                self._co_progress(company_name, 40, 'Fetching all vouchers (all years)…')
+                self.log_append('First sync — fetching complete voucher history across ALL financial years...', 'info')
+                self.log_append('⚠  This may take several minutes for large companies. Stop takes effect after Tally responds.', 'dim')
                 xml = fetch_all_vouchers_unfiltered(host, company=company or '', timeout=1800)
                 if self.stop_flag:
                     self.log_append('Stopped — data received but NOT sent to server.', 'warn')
