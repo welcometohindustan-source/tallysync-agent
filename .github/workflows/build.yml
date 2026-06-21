@@ -1,4 +1,4 @@
-name: Build TallySyncAgent + Installer
+name: Build BizView Pro Agent + Installer
 
 on:
   push:
@@ -23,59 +23,132 @@ jobs:
           python -m pip install --upgrade pip
           pip install pyinstaller cryptography pystray pillow
 
-      - name: Build TallySyncAgent.exe
+      - name: Ensure logo.ico exists from logo_icon.png or logo.png
         run: |
-          pyinstaller `
-            --onefile `
-            --windowed `
-            --name TallySyncAgent `
-            --hidden-import tkinter `
-            --hidden-import tkinter.ttk `
-            --hidden-import tkinter.messagebox `
-            --hidden-import cryptography `
-            --hidden-import cryptography.hazmat.primitives.ciphers.aead `
-            --hidden-import cryptography.hazmat.backends.openssl `
-            --hidden-import cryptography.hazmat.bindings._rust `
-            --hidden-import pystray `
-            --hidden-import PIL `
-            --hidden-import PIL.Image `
-            --hidden-import PIL.ImageDraw `
-            src/agent_gui.py
+          python -c "
+from PIL import Image
+import os, sys
+
+# Try logo_icon.png first (cleaner icon without text)
+for src in ['src/logo_icon.png', 'src/logo.png']:
+    if os.path.exists(src):
+        img = Image.open(src).convert('RGBA')
+        sizes = [(256,256),(128,128),(64,64),(48,48),(32,32),(24,24),(16,16)]
+        resized = [img.resize(s, Image.LANCZOS) for s in sizes]
+        resized[0].save('src/logo.ico', format='ICO', sizes=sizes, append_images=resized[1:])
+        print(f'Created logo.ico from {src}')
+        sys.exit(0)
+print('WARNING: No logo PNG found — exe will use default icon')
+"
+          if (Test-Path "src/logo.ico") { Write-Host "logo.ico ready" }
+
+      - name: Build BizViewProAgent.exe
+        run: |
+          $args = @(
+            "--onefile",
+            "--windowed",
+            "--name", "BizViewProAgent",
+            "--hidden-import", "tkinter",
+            "--hidden-import", "tkinter.ttk",
+            "--hidden-import", "tkinter.messagebox",
+            "--hidden-import", "cryptography",
+            "--hidden-import", "cryptography.hazmat.primitives.ciphers.aead",
+            "--hidden-import", "cryptography.hazmat.backends.openssl",
+            "--hidden-import", "cryptography.hazmat.bindings._rust",
+            "--hidden-import", "pystray",
+            "--hidden-import", "pystray._win32",
+            "--hidden-import", "PIL",
+            "--hidden-import", "PIL.Image",
+            "--hidden-import", "PIL.ImageDraw",
+            "--hidden-import", "PIL.ImageTk"
+          )
+
+          # Embed all logo files so they're accessible from _MEIPASS at runtime
+          foreach ($f in @("src/logo.ico","src/logo.png","src/logo_icon.png")) {
+            if (Test-Path $f) {
+              $args += "--add-data"
+              $args += "$f;."
+              Write-Host "Embedding $f"
+            }
+          }
+
+          # Set .exe icon to logo.ico
+          if (Test-Path "src/logo.ico") {
+            $args += "--icon"
+            $args += "src/logo.ico"
+          }
+
+          $args += "src/agent_gui.py"
+          & python -m PyInstaller @args
 
       - name: Verify EXE
         run: dir dist\
 
-      - name: Copy files for installer
+      - name: Prepare installer folder
         run: |
-          copy dist\TallySyncAgent.exe installer\TallySyncAgent.exe
+          # Copy exe to installer/ folder (NSIS expects it in dist/)
+          # NSIS File command uses dist\ path
+          copy dist\BizViewProAgent.exe installer\dist\BizViewProAgent.exe 2>$null || true
+          New-Item -ItemType Directory -Force installer\dist | Out-Null
+          copy dist\BizViewProAgent.exe installer\dist\BizViewProAgent.exe
           copy config.ini installer\config.ini
+
+          # Copy logos
+          foreach ($f in @("src/logo.ico","src/logo.png","src/logo_icon.png")) {
+            if (Test-Path $f) { copy $f installer\ }
+          }
 
       - name: Install NSIS
         run: choco install nsis -y --no-progress
 
       - name: Build NSIS Installer
         run: |
-          cd installer
-          # Create placeholder icon if not present
-          if (!(Test-Path "icon.ico")) {
-            Write-Host "No icon.ico — NSIS will use default"
-            (Get-Content TallySyncSetup.nsi) -replace '!define MUI_ICON.*', '' `
-              -replace '!define MUI_UNICON.*', '' | Set-Content TallySyncSetup.nsi
+          $icon = ""
+          if (Test-Path "installer/logo.ico") {
+            $icon = "/DICON_FILE=logo.ico"
+            Write-Host "Building installer with BizView Pro icon"
           }
-          & "C:\Program Files (x86)\NSIS\makensis.exe" TallySyncSetup.nsi
+          $nsiPath = "installer/TallySyncSetup.nsi"
+          if ($icon) {
+            & "C:\Program Files (x86)\NSIS\makensis.exe" $icon $nsiPath
+          } else {
+            & "C:\Program Files (x86)\NSIS\makensis.exe" $nsiPath
+          }
 
-      - name: Upload EXE artifact
+      - name: Rename installer output
+        run: |
+          if (Test-Path "installer/BizViewProSetup.exe") {
+            Write-Host "BizViewProSetup.exe built successfully"
+          } elseif (Test-Path "installer/TallySyncSetup.exe") {
+            Rename-Item "installer/TallySyncSetup.exe" "installer/BizViewProSetup.exe"
+          }
+
+      - name: Verify installer
+        run: dir installer\*.exe
+
+      - name: Upload Portable EXE
         uses: actions/upload-artifact@v4
         with:
-          name: TallySyncAgent-exe-only
+          name: BizViewProAgent-Portable
           path: |
-            dist/TallySyncAgent.exe
+            dist/BizViewProAgent.exe
             config.ini
           retention-days: 30
 
-      - name: Upload Installer artifact
+      - name: Upload Windows Installer
         uses: actions/upload-artifact@v4
         with:
-          name: TallySyncSetup-Installer
-          path: installer/TallySyncSetup.exe
+          name: BizViewProSetup-Installer
+          path: installer/BizViewProSetup.exe
+          retention-days: 30
+
+      - name: Create installer ZIP for website
+        run: |
+          Compress-Archive -Path installer/BizViewProSetup.exe,config.ini -DestinationPath installer/installer.zip
+
+      - name: Upload installer.zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: installer-zip
+          path: installer/installer.zip
           retention-days: 30
