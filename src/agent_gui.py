@@ -774,10 +774,6 @@ class TallySyncApp:
                     self.root.after(0, self._rebuild_company_rows)
         except Exception:
             pass  # Silent — don't disturb the user before sync
-                # Refresh UI rows to show updated open/closed state
-                self.root.after(0, self._rebuild_company_rows)
-        except Exception:
-            pass  # Silent — don't disturb the user before sync
 
     def _toggle_pause(self):
         self.paused = not self.paused
