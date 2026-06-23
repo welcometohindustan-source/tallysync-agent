@@ -1110,9 +1110,11 @@ class TallySyncApp:
                 last_sync_at = a.get('last_sync_at')
                 if last_sync_at:
                     try:
-                        from datetime import datetime as _dt
-                        dt = _dt.strptime(last_sync_at, '%Y-%m-%d %H:%M:%S')
-                        last_sync_text = dt.strftime('%d %b %Y, %H:%M')
+                        from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+                        IST = _tz(_td(hours=5, minutes=30))
+                        dt_utc = _dt.strptime(last_sync_at, '%Y-%m-%d %H:%M:%S').replace(tzinfo=_tz.utc)
+                        dt_ist = dt_utc.astimezone(IST)
+                        last_sync_text = dt_ist.strftime('%d %b %Y, %H:%M') + ' IST'
                     except Exception:
                         last_sync_text = last_sync_at
                 lbl_ls = tk.Label(inf, text=f'Last sync: {last_sync_text}',
@@ -1120,9 +1122,53 @@ class TallySyncApp:
                          font=('Segoe UI', 8), anchor='w')
                 lbl_ls.pack(anchor='w')
 
-                # Per-company Sync Now button only
+                # Per-company Sync Now + per-company auto-sync pause toggle
                 co      = dict(a)
                 btn_clr = 'primary' if is_open else 'light'
+
+                # ── Per-company pause state (stored in config.ini) ────────────
+                co_pause_key = f'co_paused__{cname}'
+                co_is_paused = (
+                    self.cfg.has_option('agent', co_pause_key) and
+                    self.cfg.get('agent', co_pause_key).strip() == '1'
+                )
+
+                def _make_co_pause_toggle(cname_=cname, key_=co_pause_key):
+                    """Return a callback that toggles per-company auto-sync pause."""
+                    def _toggle():
+                        cur = (self.cfg.has_option('agent', key_) and
+                               self.cfg.get('agent', key_).strip() == '1')
+                        new_val = '0' if cur else '1'
+                        if not self.cfg.has_section('agent'):
+                            self.cfg.add_section('agent')
+                        self.cfg.set('agent', key_, new_val)
+                        _save_cfg(self.cfg)
+                        action = 'paused' if new_val == '1' else 'resumed'
+                        self.log_append(
+                            f'Auto-sync for "{cname_}" {action}. '
+                            + ('Manual sync still works.' if new_val == '1' else ''), 'info')
+                        # Rebuild UI to reflect new button state
+                        self.root.after(0, self._render_companies)
+                    return _toggle
+
+                # Pause/resume icon button
+                pause_icon  = '⏸' if not co_is_paused else '▶'
+                pause_tip   = 'Pause auto-sync for this company' if not co_is_paused else 'Resume auto-sync for this company'
+                pause_color = 'light' if not co_is_paused else 'warn'
+                pause_btn   = self._btn(row, pause_icon, _make_co_pause_toggle(), pause_color)
+                pause_btn.config(width=3)
+                pause_btn.pack(side='right', padx=(0, 2))
+                try:
+                    pause_btn.config(cursor='hand2')
+                except Exception:
+                    pass
+
+                # Paused indicator label under company name
+                if co_is_paused:
+                    tk.Label(inf, text='⏸  Auto-sync paused for this company',
+                             bg='white', fg='#f59e0b',
+                             font=('Segoe UI', 8), anchor='w').pack(anchor='w')
+
                 sync_btn = self._btn(row, '▶ Sync Now',
                     (lambda co=co: threading.Thread(
                         target=self._do_sync_one, kwargs={'company': co}, daemon=True
@@ -1131,7 +1177,7 @@ class TallySyncApp:
                         f'"{cname}" is not currently open in TallyPrime.\n'
                         'Please open the company in Tally and try again.'),
                     btn_clr)
-                sync_btn.pack(side='right', padx=(0,4))
+                sync_btn.pack(side='right', padx=(0, 4))
 
                 if not is_open:
                     sync_btn.config(state='disabled')
@@ -1192,20 +1238,26 @@ class TallySyncApp:
         threading.Thread(target=self._do_sync_all_thread, daemon=True).start()
 
     def _do_sync_all_thread(self):
-        """Worker: iterate every assigned company, skip those not open in Tally."""
+        """Worker: iterate every assigned company, skip those not open in Tally or paused."""
         if self.syncing: return
         self.syncing   = True
         self.stop_flag = False
         self.root.after(0, lambda: self.btn_sync_all.config(state='disabled'))
         self.root.after(0, lambda: self.btn_stop.config(state='normal'))
         try:
-            tally_names       = {co['name'] for co in self.companies}
-            syncable          = [co for co in self.assigned if co['name'] in tally_names]
-            total             = len(syncable)
+            tally_names = {co['name'] for co in self.companies}
+            syncable    = [co for co in self.assigned if co['name'] in tally_names]
+            total       = len(syncable)
             for idx, co in enumerate(syncable, 1):
                 if self.stop_flag:
                     self.log_append('Sync All stopped before next company.', 'warn')
                     break
+                cname    = co.get('name', '')
+                pause_key = f'co_paused__{cname}'
+                if (self.cfg.has_option('agent', pause_key) and
+                        self.cfg.get('agent', pause_key).strip() == '1'):
+                    self.log_append(f'⏸ "{cname}" — auto-sync paused, skipping.', 'dim')
+                    continue
                 label = f'Syncing {idx} of {total} {"company" if total==1 else "companies"}…'
                 self.root.after(0, lambda l=label: self.lbl_sync_status.config(text=l))
                 self._sync_one_company(co)
