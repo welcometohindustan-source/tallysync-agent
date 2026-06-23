@@ -1151,24 +1151,7 @@ class TallySyncApp:
                         self.root.after(0, self._render_companies)
                     return _toggle
 
-                # Pause/resume icon button
-                pause_icon  = '⏸' if not co_is_paused else '▶'
-                pause_tip   = 'Pause auto-sync for this company' if not co_is_paused else 'Resume auto-sync for this company'
-                pause_color = 'light' if not co_is_paused else 'warn'
-                pause_btn   = self._btn(row, pause_icon, _make_co_pause_toggle(), pause_color)
-                pause_btn.config(width=3)
-                pause_btn.pack(side='right', padx=(0, 2))
-                try:
-                    pause_btn.config(cursor='hand2')
-                except Exception:
-                    pass
-
-                # Paused indicator label under company name
-                if co_is_paused:
-                    tk.Label(inf, text='⏸  Auto-sync paused for this company',
-                             bg='white', fg='#f59e0b',
-                             font=('Segoe UI', 8), anchor='w').pack(anchor='w')
-
+                # Sync Now button (right side)
                 sync_btn = self._btn(row, '▶ Sync Now',
                     (lambda co=co: threading.Thread(
                         target=self._do_sync_one, kwargs={'company': co}, daemon=True
@@ -1178,6 +1161,19 @@ class TallySyncApp:
                         'Please open the company in Tally and try again.'),
                     btn_clr)
                 sync_btn.pack(side='right', padx=(0, 4))
+
+                # Pause/resume icon button — immediately LEFT of Sync Now
+                pause_icon  = '⏸' if not co_is_paused else '▶'
+                pause_color = 'light' if not co_is_paused else 'warn'
+                pause_btn   = self._btn(row, pause_icon, _make_co_pause_toggle(), pause_color)
+                pause_btn.config(width=3)
+                pause_btn.pack(side='right', padx=(0, 2))
+
+                # Paused indicator under company name
+                if co_is_paused:
+                    tk.Label(inf, text='⏸  Auto-sync paused',
+                             bg='white', fg='#f59e0b',
+                             font=('Segoe UI', 8), anchor='w').pack(anchor='w')
 
                 if not is_open:
                     sync_btn.config(state='disabled')
