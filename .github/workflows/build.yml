@@ -5,6 +5,9 @@ on:
     branches: [ main, master ]
   workflow_dispatch:
 
+permissions:
+  contents: write   # needed to create GitHub Releases
+
 jobs:
   build:
     runs-on: windows-latest
@@ -52,22 +55,15 @@ jobs:
           )
           foreach ($logo in @("src/logo.ico","src/logo.png","src/logo_icon.png")) {
             if (Test-Path $logo) {
-              $pyArgs += "--add-data"
-              $pyArgs += "${logo};."
+              $pyArgs += "--add-data"; $pyArgs += "${logo};."
               Write-Host "Embedding $logo"
             }
           }
-          if (Test-Path "src/logo.ico") {
-            $pyArgs += "--icon"
-            $pyArgs += "src/logo.ico"
-          }
+          if (Test-Path "src/logo.ico") { $pyArgs += "--icon"; $pyArgs += "src/logo.ico" }
           $pyArgs += "src/agent_gui.py"
           python -m PyInstaller @pyArgs
 
-      - name: Verify EXE built
-        run: dir dist\
-
-      - name: Prepare installer staging folder
+      - name: Prepare installer staging
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force installer\dist | Out-Null
@@ -85,53 +81,69 @@ jobs:
         run: |
           $nsis = "C:\Program Files (x86)\NSIS\makensis.exe"
           $nsi  = "installer\TallySyncSetup.nsi"
-          if (Test-Path "installer\logo.ico") {
-            & $nsis "/DICON_FILE=logo.ico" $nsi
-          } else {
-            & $nsis $nsi
-          }
+          if (Test-Path "installer\logo.ico") { & $nsis "/DICON_FILE=logo.ico" $nsi }
+          else { & $nsis $nsi }
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Rename installer to BizViewProSetup.exe
+      - name: Rename installer
         shell: pwsh
         run: |
           if (Test-Path "installer\TallySyncSetup.exe") {
             Rename-Item "installer\TallySyncSetup.exe" "BizViewProSetup.exe"
-          } elseif (Test-Path "installer\BizViewProSetup.exe") {
-            Write-Host "BizViewProSetup.exe already exists"
-          } else {
+          } elseif (-not (Test-Path "installer\BizViewProSetup.exe")) {
             Write-Host "ERROR: no installer exe found"; dir installer\; exit 1
           }
 
-      - name: Verify installer
-        run: dir installer\*.exe
-
-      - name: Create installer.zip for website download
+      - name: Create installer.zip
         shell: pwsh
         run: |
           $items = @("installer\BizViewProSetup.exe")
           if (Test-Path config.ini) { $items += "config.ini" }
-          Compress-Archive -Path $items -DestinationPath installer\installer.zip -Force
+          Compress-Archive -Path $items -DestinationPath installer\BizViewProSetup.zip -Force
 
-      - name: Upload portable EXE artifact
-        uses: actions/upload-artifact@v4
+      # ── Auto-publish GitHub Release on every push ──────────────────────────
+      - name: Generate version tag
+        id: version
+        shell: pwsh
+        run: |
+          $ts = Get-Date -Format "yyyy.MM.dd-HHmm"
+          $sha = "${{ github.sha }}".Substring(0,7)
+          echo "tag=v$ts-$sha" >> $env:GITHUB_OUTPUT
+          echo "name=BizView Pro Agent $ts" >> $env:GITHUB_OUTPUT
+
+      - name: Delete existing 'latest' release (if any)
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete latest --yes 2>$null; exit 0
+
+      - name: Create GitHub Release (latest)
+        uses: softprops/action-gh-release@v2
         with:
-          name: BizViewProAgent-Portable
-          path: |
-            dist/BizViewProAgent.exe
-            config.ini
-          retention-days: 30
+          tag_name: latest
+          name: "BizView Pro Agent — Latest Build"
+          body: |
+            **Auto-published on every push to main.**
 
-      - name: Upload installer EXE artifact
+            ### Downloads
+            | File | Description |
+            |------|-------------|
+            | `BizViewProSetup.zip` | **Recommended** — full Windows installer (double-click to install) |
+            | `BizViewProAgent.exe` | Portable EXE — run directly, no install needed |
+
+            Built from commit ${{ github.sha }} on ${{ github.ref_name }}
+          prerelease: false
+          make_latest: true
+          files: |
+            installer/BizViewProSetup.zip
+            dist/BizViewProAgent.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload artifacts (also kept for 30 days)
         uses: actions/upload-artifact@v4
         with:
           name: BizViewProSetup-Installer
-          path: installer/BizViewProSetup.exe
-          retention-days: 30
-
-      - name: Upload installer.zip artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: installer-zip
-          path: installer/installer.zip
+          path: installer/BizViewProSetup.zip
           retention-days: 30
