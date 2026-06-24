@@ -118,7 +118,7 @@ DEFAULTS = {'agent': {
 }}
 
 def load_cfg():
-    cfg = configparser.ConfigParser(inline_comment_prefixes=(';','#'))
+    cfg = configparser.ConfigParser(inline_comment_prefixes=(';','#'), strict=False, allow_no_value=True)
     cfg.read_dict(DEFAULTS)
     if CONFIG_FILE.exists():
         cfg.read(str(CONFIG_FILE), encoding='utf-8')
@@ -1010,7 +1010,7 @@ class TallySyncApp:
         most_recent = None  # 'YYYY-MM-DD HH:MM:SS' string, compared lexically (safe for this format)
         for a in self.assigned:
             name = a.get('name', '')
-            key  = ('last_voucher_alterid__' + name) if name else 'last_voucher_alterid'
+            key  = ('last_voucher_alterid__' + re.sub(r'[/\\\s]', '_', name)) if name else 'last_voucher_alterid'
             try:
                 server_alterid = int(a.get('last_voucher_alterid', 0) or 0)
             except (TypeError, ValueError):
@@ -1127,7 +1127,7 @@ class TallySyncApp:
                 btn_clr = 'primary' if is_open else 'light'
 
                 # ── Per-company pause state (stored in config.ini) ────────────
-                co_pause_key = f'co_paused__{cname}'
+                co_pause_key = f'co_paused__{re.sub(chr(47), "_", cname)}'
                 co_is_paused = (
                     self.cfg.has_option('agent', co_pause_key) and
                     self.cfg.get('agent', co_pause_key).strip() == '1'
@@ -1142,7 +1142,7 @@ class TallySyncApp:
                         if not self.cfg.has_section('agent'):
                             self.cfg.add_section('agent')
                         self.cfg.set('agent', key_, new_val)
-                        _save_cfg(self.cfg)
+                        save_cfg(self.cfg)
                         action = 'paused' if new_val == '1' else 'resumed'
                         self.log_append(
                             f'Auto-sync for "{cname_}" {action}. '
@@ -1249,7 +1249,7 @@ class TallySyncApp:
                     self.log_append('Sync All stopped before next company.', 'warn')
                     break
                 cname    = co.get('name', '')
-                pause_key = f'co_paused__{cname}'
+                pause_key = 'co_paused__' + re.sub(r'[/\\\s]', '_', cname)
                 if (self.cfg.has_option('agent', pause_key) and
                         self.cfg.get('agent', pause_key).strip() == '1'):
                     self.log_append(f'⏸ "{cname}" — auto-sync paused, skipping.', 'dim')
@@ -1352,7 +1352,7 @@ class TallySyncApp:
                         if not self.cfg.has_section('agent'):
                             self.cfg.add_section('agent')
                         self.cfg.set('agent', ledger_hash_key, xml_hash)
-                        _save_cfg(self.cfg)
+                        save_cfg(self.cfg)
                     else:
                         self.log_append(f'  └ {res.get("error")}','error')
             else:
@@ -1383,7 +1383,7 @@ class TallySyncApp:
                     self.log_append(f'Stock saved: {saved}','ok' if res.get('ok') else 'error')
                     if res.get('ok'):
                         self.cfg.set('agent', stock_hash_key, xml_hash)
-                        _save_cfg(self.cfg)
+                        save_cfg(self.cfg)
                     else:
                         self.log_append(f'  └ {res.get("error")}','error')
             else:
@@ -1393,7 +1393,7 @@ class TallySyncApp:
             self._co_progress(company_name, 35, 'Stock done.')
 
             # ── 3. Vouchers ──────────────────────────────────────────────────
-            alterid_key = ('last_voucher_alterid__' + company_name) if company_name else 'last_voucher_alterid'
+            alterid_key = ('last_voucher_alterid__' + re.sub(r'[/\\\s]', '_', company_name)) if company_name else 'last_voucher_alterid'
             last_alterid = 0
             if self.cfg.has_option('agent', alterid_key):
                 try: last_alterid = int(self.cfg.get('agent', alterid_key).strip() or '0')
@@ -1651,7 +1651,7 @@ class SetupWindow:
     def _save(self):
         raw = self.txt.get('1.0','end').strip()
         try:
-            cfg = configparser.ConfigParser(inline_comment_prefixes=(';','#'))
+            cfg = configparser.ConfigParser(inline_comment_prefixes=(';','#'), strict=False, allow_no_value=True)
             cfg.read_string(raw)
             if not cfg.has_section('agent'):
                 self.lbl_err.config(text='Error: config must start with [agent]')
@@ -1845,7 +1845,7 @@ def run_once_headless():
                 log.info(f"[{uid}{label}] Stock: {res}")
             time.sleep(1.1)
 
-            alterid_key  = ('last_voucher_alterid__' + cname) if cname else 'last_voucher_alterid'
+            alterid_key  = ('last_voucher_alterid__' + re.sub(r'[/\\\s]', '_', cname)) if cname else 'last_voucher_alterid'
             last_alterid = int(_g(alterid_key, '0') or '0')
             try:
                 server_alterid = int(co.get('last_voucher_alterid', 0) or 0)
