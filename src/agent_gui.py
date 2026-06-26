@@ -113,7 +113,8 @@ DEFAULTS = {'agent': {
     'server_url': 'http://localhost/tallysync/api/ingest.php',
     'tally_host': 'http://localhost:9000',
     'interval_min': '5', 'compress': 'true', 'encrypt': 'true',
-    'last_voucher_alterid': '',  # internal: AlterID watermark for incremental sync
+    'last_voucher_alterid': '',  # internal: AlterID watermark for incremental voucher sync
+    'last_master_alterid': '',   # internal: AlterID watermark for incremental master sync
     'voucher_batch_size': '500',  # vouchers per request when sending to server
 }}
 
@@ -261,6 +262,87 @@ def fetch_vouchers_by_alterid(host, min_alterid, company=''):
         '</TDL></DESC></BODY></ENVELOPE>'
     )
     return tally_post(host, xml, timeout=300)
+
+def fetch_ledgers_by_alterid(host, min_alterid, company=''):
+    """Incremental ledger sync — only ledgers with AlterID > min_alterid.
+    Tally bumps AlterID on every master save (create, edit, delete).
+    Returns XML with only changed/new/deleted ledgers."""
+    comp_var = f'<SVCURRENTCOMPANY>{escape(company)}</SVCURRENTCOMPANY>' if company else ''
+    fields = ','.join([
+        'GUID','ALTERID','NAME','PARENT','CLOSINGBALANCE','OPENINGBALANCE',
+        'LEDMAILINGDETAILS.LIST.MAILINGNAME',
+        'LEDMAILINGDETAILS.LIST.PINCODE',
+        'LEDMAILINGDETAILS.LIST.PHONENUMBER',
+        'LEDMAILINGDETAILS.LIST.MOBILEPHONE',
+        'LEDMAILINGDETAILS.LIST.LANDLINEPHONE',
+        'CONTACTNO','PHONENUMBER','MOBILEPHONE','ISDELETEDMASTER',
+    ])
+    xml = (
+        '<ENVELOPE><HEADER><VERSION>1</VERSION>'
+        '<TALLYREQUEST>Export</TALLYREQUEST>'
+        '<TYPE>Collection</TYPE><ID>TSLedIncr</ID></HEADER>'
+        '<BODY><DESC><STATICVARIABLES>'
+        '<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>'
+        f'{comp_var}'
+        '</STATICVARIABLES>'
+        '<TDL><TDLMESSAGE>'
+        '<COLLECTION NAME="TSLedIncr" ISMODIFY="No">'
+        '<TYPE>Ledger</TYPE>'
+        '<FILTER>TSMasterAlterFilter</FILTER>'
+        f'<FETCH>{fields}</FETCH>'
+        '</COLLECTION>'
+        '</TDLMESSAGE>'
+        '<TDLMESSAGE>'
+        f'<SYSTEM TYPE="Formulae" NAME="TSMasterAlterFilter">$AlterId &gt; {int(min_alterid)}</SYSTEM>'
+        '</TDLMESSAGE>'
+        '</TDL></DESC></BODY></ENVELOPE>'
+    )
+    return tally_post(host, xml, timeout=120)
+
+
+def fetch_stock_by_alterid(host, min_alterid, company=''):
+    """Incremental stock item sync — only items with AlterID > min_alterid."""
+    comp_var = f'<SVCURRENTCOMPANY>{escape(company)}</SVCURRENTCOMPANY>' if company else ''
+    fields = ','.join([
+        'GUID','ALTERID','NAME','PARENT','BASEUNITS',
+        'OPENINGBALANCE','OPENINGVALUE','OPENINGRATE',
+        'CLOSINGBALANCE','CLOSINGVALUE','CLOSINGRATE','ISDELETEDMASTER',
+    ])
+    xml = (
+        '<ENVELOPE><HEADER><VERSION>1</VERSION>'
+        '<TALLYREQUEST>Export</TALLYREQUEST>'
+        '<TYPE>Collection</TYPE><ID>TSStockIncr</ID></HEADER>'
+        '<BODY><DESC><STATICVARIABLES>'
+        '<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>'
+        f'{comp_var}'
+        '</STATICVARIABLES>'
+        '<TDL><TDLMESSAGE>'
+        '<COLLECTION NAME="TSStockIncr" ISMODIFY="No">'
+        '<TYPE>StockItem</TYPE>'
+        '<FILTER>TSMasterAlterFilter</FILTER>'
+        f'<FETCH>{fields}</FETCH>'
+        '</COLLECTION>'
+        '</TDLMESSAGE>'
+        '<TDLMESSAGE>'
+        f'<SYSTEM TYPE="Formulae" NAME="TSMasterAlterFilter">$AlterId &gt; {int(min_alterid)}</SYSTEM>'
+        '</TDLMESSAGE>'
+        '</TDL></DESC></BODY></ENVELOPE>'
+    )
+    return tally_post(host, xml, timeout=120)
+
+
+def extract_max_master_alterid(xml):
+    """Extract the highest AlterID seen in a master (ledger/stock) XML response."""
+    max_id = 0
+    for m in re.findall(r'<ALTERID[^>]*>(.*?)</ALTERID>', xml, re.I | re.S):
+        try:
+            v = int(re.sub(r'[^0-9]', '', m.strip()))
+            if v > max_id:
+                max_id = v
+        except (ValueError, TypeError):
+            pass
+    return max_id
+
 
 VOUCHER_BLOCK_RE = re.compile(r'<VOUCHER\b.*?</VOUCHER>', re.S)
 
@@ -1333,71 +1415,100 @@ class TallySyncApp:
             return
 
         try:
-            # ── 1. Ledgers ───────────────────────────────────────────────────
-            self._co_progress(company_name, 5, 'Fetching ledgers…')
-            xml = fetch_ledgers(host, company=company or '')
-            self.log_append(f'Ledgers: {len(xml):,} bytes from Tally','dim')
-            # Detect Tally errors before trying to parse/send
+            # ── 1 & 2. Masters (Ledgers + Stock) — Incremental via AlterID ────
+            # First sync: full master download. Subsequent: only changed masters.
+            master_key = 'last_master_alterid__' + re.sub(r'[/\\\s]', '_', company_name) if company_name else 'last_master_alterid'
+            last_master_alterid = 0
+            if self.cfg.has_option('agent', master_key):
+                try: last_master_alterid = int(self.cfg.get('agent', master_key).strip() or '0')
+                except ValueError: pass
+
+            is_first_master_sync = (last_master_alterid == 0)
+            max_master_alterid   = last_master_alterid
+
+            # ── 1. Ledgers ────────────────────────────────────────────────────
+            self._co_progress(company_name, 5,
+                'Fetching all ledgers (first sync)…' if is_first_master_sync
+                else f'Checking ledger changes since AlterID {last_master_alterid}…')
+            if is_first_master_sync:
+                xml = fetch_ledgers(host, company=company or '')
+                extra = {}
+            else:
+                xml = fetch_ledgers_by_alterid(host, last_master_alterid, company=company or '')
+                extra = {'is_incremental': '1'}
+
+            self.log_append(f'Ledgers: {len(xml):,} bytes from Tally', 'dim')
             if '<LINEERROR>' in xml.upper():
                 err_m = re.search(r'<LINEERROR>(.*?)</LINEERROR>', xml, re.I | re.S)
                 self.log_append(f'Tally error fetching ledgers: {(err_m.group(1) if err_m else xml[:200]).strip()}', 'error')
             elif '<LEDGER' in xml.upper():
-                # Hash-based skip: only upload if ledger data changed since last sync
-                import hashlib
-                ledger_hash_key = 'ledger_hash__' + company_name.replace(' ','_')
-                xml_hash = hashlib.md5(xml.encode('utf-8', errors='ignore')).hexdigest()
-                cached_hash = self.cfg.get('agent', ledger_hash_key, fallback='')
-                if xml_hash == cached_hash:
-                    self.log_append('Ledgers unchanged since last sync — skipped (faster)','dim')
-                else:
-                    self._co_progress(company_name, 12, 'Sending ledgers…')
-                    bundle = build_bundle(uid,'ledgers',xml)
-                    res    = send_bundle(srv,uid,key,bundle,cmp_,enc_,sec)
-                    saved  = res.get('saved',0) if res.get('ok') else 0
-                    self.log_append(f'Ledgers saved: {saved}','ok' if res.get('ok') else 'error')
-                    if res.get('ok'):
-                        if not self.cfg.has_section('agent'):
-                            self.cfg.add_section('agent')
-                        self.cfg.set('agent', ledger_hash_key, xml_hash)
-                        save_cfg(self.cfg)
-                    else:
-                        self.log_append(f'  └ {res.get("error")}','error')
+                new_max = extract_max_master_alterid(xml)
+                if new_max > max_master_alterid:
+                    max_master_alterid = new_max
+                mode_label = 'full' if is_first_master_sync else f'incremental (AlterID>{last_master_alterid})'
+                self._co_progress(company_name, 12, 'Sending ledgers…')
+                bundle = build_bundle(uid, 'ledgers', xml)
+                res    = send_bundle(srv, uid, key, bundle, cmp_, enc_, sec, extra=extra)
+                saved  = res.get('saved', 0) if res.get('ok') else 0
+                self.log_append(f'Ledgers {mode_label}: {saved} saved',
+                                'ok' if res.get('ok') else 'error')
+                if not res.get('ok'):
+                    self.log_append(f'  └ {res.get("error")}', 'error')
             else:
-                self.log_append('No ledger data from Tally','warn')
+                if is_first_master_sync:
+                    self.log_append('No ledger data from Tally', 'warn')
+                else:
+                    self.log_append('No ledger changes since last sync ✓', 'dim')
+
             if self.stop_flag: raise Exception('Stopped')
             time.sleep(0.5)
             self._co_progress(company_name, 20, 'Ledgers done.')
 
-            # ── 2. Stock ─────────────────────────────────────────────────────
-            self._co_progress(company_name, 22, 'Fetching stock…')
-            xml = fetch_stock(host, company=company or '')
-            self.log_append(f'Stock: {len(xml):,} bytes from Tally','dim')
+            # ── 2. Stock Items ────────────────────────────────────────────────
+            self._co_progress(company_name, 22,
+                'Fetching all stock items (first sync)…' if is_first_master_sync
+                else f'Checking stock changes since AlterID {last_master_alterid}…')
+            if is_first_master_sync:
+                xml = fetch_stock(host, company=company or '')
+                extra_s = {}
+            else:
+                xml = fetch_stock_by_alterid(host, last_master_alterid, company=company or '')
+                extra_s = {'is_incremental': '1'}
+
+            self.log_append(f'Stock: {len(xml):,} bytes from Tally', 'dim')
             if '<LINEERROR>' in xml.upper():
                 err_m = re.search(r'<LINEERROR>(.*?)</LINEERROR>', xml, re.I | re.S)
                 self.log_append(f'Tally error fetching stock: {(err_m.group(1) if err_m else xml[:200]).strip()}', 'error')
             elif '<STOCKITEM' in xml.upper():
-                # Hash-based skip for stock too
-                stock_hash_key = 'stock_hash__' + company_name.replace(' ','_')
-                xml_hash = hashlib.md5(xml.encode('utf-8', errors='ignore')).hexdigest()
-                cached_hash = self.cfg.get('agent', stock_hash_key, fallback='')
-                if xml_hash == cached_hash:
-                    self.log_append('Stock items unchanged since last sync — skipped (faster)','dim')
-                else:
-                    self._co_progress(company_name, 28, 'Sending stock…')
-                    bundle = build_bundle(uid,'stock',xml)
-                    res    = send_bundle(srv,uid,key,bundle,cmp_,enc_,sec)
-                    saved  = res.get('saved',0) if res.get('ok') else 0
-                    self.log_append(f'Stock saved: {saved}','ok' if res.get('ok') else 'error')
-                    if res.get('ok'):
-                        self.cfg.set('agent', stock_hash_key, xml_hash)
-                        save_cfg(self.cfg)
-                    else:
-                        self.log_append(f'  └ {res.get("error")}','error')
+                new_max = extract_max_master_alterid(xml)
+                if new_max > max_master_alterid:
+                    max_master_alterid = new_max
+                mode_label = 'full' if is_first_master_sync else f'incremental (AlterID>{last_master_alterid})'
+                self._co_progress(company_name, 28, 'Sending stock…')
+                bundle = build_bundle(uid, 'stock', xml)
+                res    = send_bundle(srv, uid, key, bundle, cmp_, enc_, sec, extra=extra_s)
+                saved  = res.get('saved', 0) if res.get('ok') else 0
+                self.log_append(f'Stock {mode_label}: {saved} saved',
+                                'ok' if res.get('ok') else 'error')
+                if not res.get('ok'):
+                    self.log_append(f'  └ {res.get("error")}', 'error')
             else:
-                self.log_append('No stock data from Tally (F11 → Enable Inventory)','warn')
+                if is_first_master_sync:
+                    self.log_append('No stock data from Tally (F11 → Enable Inventory)', 'warn')
+                else:
+                    self.log_append('No stock changes since last sync ✓', 'dim')
+
             if self.stop_flag: raise Exception('Stopped')
             time.sleep(0.5)
-            self._co_progress(company_name, 35, 'Stock done.')
+            self._co_progress(company_name, 35, 'Masters done.')
+
+            # ── Save master AlterID watermark ─────────────────────────────────
+            if max_master_alterid > last_master_alterid:
+                if not self.cfg.has_section('agent'):
+                    self.cfg.add_section('agent')
+                self.cfg.set('agent', master_key, str(max_master_alterid))
+                save_cfg(self.cfg)
+                self.log_append(f'Master AlterID watermark updated: {last_master_alterid} → {max_master_alterid}', 'dim')
 
             # ── 3. Vouchers ──────────────────────────────────────────────────
             alterid_key = ('last_voucher_alterid__' + re.sub(r'[/\\\s]', '_', company_name)) if company_name else 'last_voucher_alterid'
