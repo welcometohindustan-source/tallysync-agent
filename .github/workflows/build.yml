@@ -111,12 +111,15 @@ jobs:
           echo "tag=v$ts-$sha" >> $env:GITHUB_OUTPUT
           echo "name=BizView Pro Agent $ts" >> $env:GITHUB_OUTPUT
 
-      - name: Delete existing 'latest' release (if any)
+      - name: Delete existing 'latest' release and tag (if any)
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release delete latest --yes 2>$null; exit 0
+          gh release delete latest --yes --cleanup-tag 2>$null
+          git tag -d latest 2>$null
+          git push --delete origin latest 2>$null
+          exit 0
 
       - name: Create GitHub Release (latest)
         uses: softprops/action-gh-release@v2
@@ -135,6 +138,7 @@ jobs:
             Built from commit ${{ github.sha }} on ${{ github.ref_name }}
           prerelease: false
           make_latest: true
+          fail_on_unmatched_files: false
           files: |
             installer/BizViewProSetup.zip
             dist/BizViewProAgent.exe
