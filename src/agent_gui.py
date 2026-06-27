@@ -1152,7 +1152,12 @@ class TallySyncApp:
             w.destroy()
         self.co_progress = {}
 
+        tally_by_guid = {co['guid']: co['name'] for co in self.companies if co.get('guid','')}
         tally_names = {co['name'] for co in self.companies}
+        def _co_is_open(a):
+            g = a.get('tally_guid','')
+            if g and g in tally_by_guid: return True
+            return a.get('name','') in tally_names
 
         if len(self.assigned) > 1:
             self.btn_sync_all.config(text='▶  Sync All')
@@ -1163,11 +1168,11 @@ class TallySyncApp:
             # Sort: open companies (in Tally right now) first, closed ones below
             self.assigned = sorted(
                 self.assigned,
-                key=lambda a: (0 if a['name'] in tally_names else 1)
+                key=lambda a: (0 if _co_is_open(a) else 1)
             )
             for a in self.assigned:
                 cname      = a['name']
-                is_open    = cname in tally_names   # is the company open in TallyPrime right now?
+                is_open    = _co_is_open(a)   # is the company open in TallyPrime right now?
 
                 # ── Separator ────────────────────────────────────────────────
                 sep = tk.Frame(self.co_frame, bg='#f3f4f6', height=1)
@@ -1330,8 +1335,15 @@ class TallySyncApp:
         self.root.after(0, lambda: self.btn_sync_all.config(state='disabled'))
         self.root.after(0, lambda: self.btn_stop.config(state='normal'))
         try:
-            tally_names = {co['name'] for co in self.companies}
-            syncable    = [co for co in self.assigned if co['name'] in tally_names]
+            # Match by GUID first (handles same-name companies), then by name fallback
+            tally_by_guid = {co['guid']: co['name'] for co in self.companies if co.get('guid','')}
+            tally_names   = {co['name'] for co in self.companies}
+            def _is_open(assigned_co):
+                g = assigned_co.get('tally_guid','')
+                if g and g in tally_by_guid:
+                    return True
+                return assigned_co.get('name','') in tally_names
+            syncable    = [co for co in self.assigned if _is_open(co)]
             total       = len(syncable)
             for idx, co in enumerate(syncable, 1):
                 if self.stop_flag:
@@ -1398,8 +1410,12 @@ class TallySyncApp:
             sec          = _gcfg('secret_key', '')
 
         # ── Skip if company is not open in TallyPrime right now ──────────────
-        tally_names = {co['name'] for co in self.companies}
-        if company_name and company_name not in tally_names:
+        # Match by GUID first (correct for same-name companies), name as fallback
+        tally_by_guid = {co['guid']: co['name'] for co in self.companies if co.get('guid','')}
+        tally_names   = {co['name'] for co in self.companies}
+        assigned_guid = company.get('tally_guid','') if isinstance(company, dict) else ''
+        is_open = (assigned_guid and assigned_guid in tally_by_guid) or (company_name in tally_names)
+        if company_name and not is_open:
             self.log_append(
                 f'Skipping "{company_name}" — not currently open in TallyPrime.', 'warn')
             self._co_progress(company_name, 0, 'Skipped — not open in Tally')
