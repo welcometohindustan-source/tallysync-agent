@@ -1198,22 +1198,41 @@ class TallySyncApp:
             w.destroy()
         self.co_progress = {}
 
-        # Build compound key: GUID+number for same-name company disambiguation
+        # Build lookup structures for open-company checking
+        # Key insight: same-name companies (100002 vs 100010) MUST be matched by number,
+        # not just by GUID (split-year companies may share the same GUID).
+        tally_by_num      = {co.get('number',''): co for co in self.companies if co.get('number','')}
         tally_by_guid_num = {(co.get('guid',''), co.get('number','')): True for co in self.companies if co.get('guid','')}
         tally_by_guid_map = {co.get('guid',''): co for co in self.companies if co.get('guid','')}
         tally_names       = {co['name'] for co in self.companies}
+        # Count how many open companies share each name (to detect same-name situation)
+        from collections import Counter
+        tally_name_counts = Counter(co['name'] for co in self.companies)
 
         def _co_is_open(a):
             ag = a.get('tally_guid','')
-            an = a.get('tally_number','')
-            if ag and an and (ag, an) in tally_by_guid_num:
-                return True
+            an = a.get('tally_number','')  # number stored on portal (may be '' for old rows)
+            name = a.get('name','')
+
+            # CASE 1: Portal has number stored — use number as primary key
+            if an:
+                # Check if THIS number is currently open in Tally
+                if an in tally_by_num:
+                    return True   # correct company is open
+                # Number not found in open companies → this company is NOT open
+                return False
+
+            # CASE 2: Portal has no number yet (old row, hasn't re-connected since update)
+            # Use GUID match but guard against same-name ambiguity
             if ag and ag in tally_by_guid_map:
                 tc = tally_by_guid_map[ag]
-                if an and tc.get('number','') and an != tc.get('number',''):
-                    return False  # same GUID but different number = different company
-                return True
-            return not ag and a.get('name','') in tally_names
+                # If this name appears multiple times in Tally (same-name situation)
+                # and we have no number to disambiguate → BLOCK (safer than syncing wrong co)
+                if tally_name_counts.get(name, 0) > 1:
+                    return False  # ambiguous — user must reconnect to store number
+                return True  # unique name + GUID match → safe
+            # CASE 3: No GUID at all — pure name match (very old rows)
+            return not ag and name in tally_names and tally_name_counts.get(name, 0) == 1
 
         if len(self.assigned) > 1:
             self.btn_sync_all.config(text='▶  Sync All')
@@ -1230,8 +1249,12 @@ class TallySyncApp:
                 cname      = a['name']
                 # Show number suffix if two assigned companies share the same name
                 same_count = sum(1 for x in self.assigned if x['name'] == cname)
-                if same_count > 1 and a.get('tally_number',''):
-                    cname = f"{cname}  [{a['tally_number']}]"
+                if same_count > 1:
+                    num = a.get('tally_number','')
+                    if num:
+                        cname = f"{cname}  [{num}]"
+                    else:
+                        cname = f"{cname}  [reconnect to identify]"
                 is_open    = _co_is_open(a)   # is the company open in TallyPrime right now?
 
                 # ── Separator ────────────────────────────────────────────────
@@ -1395,18 +1418,23 @@ class TallySyncApp:
         self.root.after(0, lambda: self.btn_sync_all.config(state='disabled'))
         self.root.after(0, lambda: self.btn_stop.config(state='normal'))
         try:
-            # GUID+number matching to handle same-name companies (100002 vs 100010)
-            tally_by_guid_num2 = {(co.get('guid',''), co.get('number','')): True for co in self.companies if co.get('guid','')}
+            # Number-first matching for same-name companies (100002 vs 100010)
+            from collections import Counter
+            tally_by_num2      = {co.get('number',''): co for co in self.companies if co.get('number','')}
             tally_by_guid_map2 = {co.get('guid',''): co for co in self.companies if co.get('guid','')}
-            tally_names        = {co['name'] for co in self.companies}
+            tally_names2       = {co['name'] for co in self.companies}
+            tally_name_cnt2    = Counter(co['name'] for co in self.companies)
             def _sa_is_open(a):
-                ag = a.get('tally_guid',''); an = a.get('tally_number','')
-                if ag and an and (ag, an) in tally_by_guid_num2: return True
+                an = a.get('tally_number','')
+                ag = a.get('tally_guid','')
+                nm = a.get('name','')
+                if an:
+                    return an in tally_by_num2
                 if ag and ag in tally_by_guid_map2:
-                    tc = tally_by_guid_map2[ag]
-                    if an and tc.get('number','') and an != tc.get('number',''): return False
+                    if tally_name_cnt2.get(nm, 0) > 1:
+                        return False  # ambiguous same-name, no number stored
                     return True
-                return not ag and a.get('name','') in tally_names
+                return not ag and nm in tally_names2 and tally_name_cnt2.get(nm, 0) == 1
             syncable    = [co for co in self.assigned if _sa_is_open(co)]
             total       = len(syncable)
             for idx, co in enumerate(syncable, 1):
@@ -1474,21 +1502,22 @@ class TallySyncApp:
             sec          = _gcfg('secret_key', '')
 
         # ── Skip if company is not open in TallyPrime right now ──────────────
-        # Match by GUID+number to correctly handle same-name companies (100002 vs 100010)
-        assigned_guid   = company.get('tally_guid','')   if isinstance(company, dict) else ''
+        # Use company NUMBER as the primary key — handles same-name companies (100002 vs 100010)
+        from collections import Counter
         assigned_number = company.get('tally_number','') if isinstance(company, dict) else ''
-        tally_by_guid_n = {(co.get('guid',''), co.get('number','')): True for co in self.companies if co.get('guid','')}
+        assigned_guid   = company.get('tally_guid','')   if isinstance(company, dict) else ''
+        tally_by_num_s  = {co.get('number',''): co for co in self.companies if co.get('number','')}
         tally_by_guid_s = {co.get('guid',''): co for co in self.companies if co.get('guid','')}
         tally_names     = {co['name'] for co in self.companies}
+        tally_name_cnt  = Counter(co['name'] for co in self.companies)
         def _this_co_open():
-            if assigned_guid and assigned_number and (assigned_guid, assigned_number) in tally_by_guid_n:
-                return True
+            if assigned_number:
+                return assigned_number in tally_by_num_s
             if assigned_guid and assigned_guid in tally_by_guid_s:
-                tc = tally_by_guid_s[assigned_guid]
-                if assigned_number and tc.get('number','') and assigned_number != tc.get('number',''):
-                    return False
+                if tally_name_cnt.get(company_name, 0) > 1:
+                    return False  # same-name ambiguity, need reconnect to store number
                 return True
-            return not assigned_guid and company_name in tally_names
+            return not assigned_guid and company_name in tally_names                    and tally_name_cnt.get(company_name, 0) == 1
         if company_name and not _this_co_open():
             self.log_append(
                 f'Skipping "{company_name}" — not currently open in TallyPrime.', 'warn')
