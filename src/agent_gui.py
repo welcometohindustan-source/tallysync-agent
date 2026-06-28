@@ -199,7 +199,8 @@ def collection_xml(name, typ, fields, fd='', td='', company=''):
             f'</COLLECTION></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>')
 
 def fetch_companies(host):
-    return tally_post(host, collection_xml('TSCo','Company',['NAME','GUID']), timeout=15)
+    return tally_post(host, collection_xml('TSCo','Company',
+        ['NAME','GUID','COMPANYNUMBER','BASICCOMPANYNUMBER']), timeout=15)
 
 def fetch_ledgers(host, company=''):
     return tally_post(host, collection_xml('TSLed','Ledger',
@@ -345,6 +346,40 @@ def extract_max_master_alterid(xml):
 
 
 VOUCHER_BLOCK_RE = re.compile(r'<VOUCHER\b.*?</VOUCHER>', re.S)
+
+def fetch_voucher_numbers_for_renumber(host, company='', from_date=None, to_date=None):
+    """
+    Lightweight fetch — only GUID and VOUCHERNUMBER for all vouchers in date range.
+    Used after incremental sync to catch vouchers that were renumbered by Tally
+    (e.g. inserting a voucher between existing ones shifts all subsequent numbers).
+    Returns list of {'guid': ..., 'no': ...}
+    """
+    comp_var = f'<SVCURRENTCOMPANY>{escape(company)}</SVCURRENTCOMPANY>' if company else ''
+    fd = from_date or ''
+    td = to_date   or ''
+    dates = (f'<SVFROMDATE>{fd}</SVFROMDATE>' if fd else '') +             (f'<SVTODATE>{td}</SVTODATE>'     if td else '')
+    xml = (f'<ENVELOPE><HEADER><VERSION>1</VERSION>'
+           f'<TALLYREQUEST>Export</TALLYREQUEST>'
+           f'<TYPE>Collection</TYPE><ID>TSVnoRenumber</ID></HEADER>'
+           f'<BODY><DESC><STATICVARIABLES>'
+           f'<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>{dates}{comp_var}'
+           f'</STATICVARIABLES><TDL><TDLMESSAGE>'
+           f'<COLLECTION NAME="TSVnoRenumber" ISMODIFY="No">'
+           f'<TYPE>Voucher</TYPE>'
+           f'<FETCH>GUID,VOUCHERNUMBER</FETCH>'
+           f'</COLLECTION></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>')
+    resp = tally_post(host, xml, timeout=60)
+    pairs = []
+    if resp:
+        for m in re.finditer(r'<VOUCHER[^>]*>(.*?)</VOUCHER>', resp, re.S|re.I):
+            blk  = m.group(1)
+            gm   = re.search(r'<GUID[^>]*>(.*?)</GUID>', blk, re.I)
+            nm   = re.search(r'<VOUCHERNUMBER[^>]*>(.*?)</VOUCHERNUMBER>', blk, re.I)
+            guid = gm.group(1).strip() if gm else ''
+            no   = nm.group(1).strip() if nm else ''
+            if guid and no:
+                pairs.append({'guid': guid, 'no': no})
+    return pairs
 
 def fetch_all_vouchers_unfiltered(host, company='', timeout=1800):
     """Fetch ALL vouchers for a company in ONE request — no date/alterid
@@ -553,9 +588,15 @@ def agent_companies_url(server_url):
     """Derive api/agent_companies.php from the configured api/ingest.php URL."""
     if server_url.endswith('ingest.php'):
         return server_url[:-len('ingest.php')] + 'agent_companies.php'
-    # fallback: assume same directory
     base = server_url.rsplit('/', 1)[0]
     return base + '/agent_companies.php'
+
+def renumber_vouchers_url(server_url):
+    """Derive api/renumber_vouchers.php from the configured ingest URL."""
+    if server_url.endswith('ingest.php'):
+        return server_url[:-len('ingest.php')] + 'renumber_vouchers.php'
+    base = server_url.rsplit('/', 1)[0]
+    return base + '/renumber_vouchers.php'
 
 def discover_companies_on_server(server_url, master_key, master_secret, companies):
     """Tell the portal which Tally companies the agent can see."""
@@ -564,7 +605,7 @@ def discover_companies_on_server(server_url, master_key, master_secret, companie
         'master_key': master_key,
         'master_secret': master_secret,
         'action': 'discover',
-        'companies_json': json.dumps([{'name': c['name'], 'guid': c.get('guid','')} for c in companies]),
+        'companies_json': json.dumps([{'name': c['name'], 'guid': c.get('guid',''), 'number': c.get('number','')} for c in companies]),
     })
 
 def list_assigned_companies(server_url, master_key, master_secret):
@@ -587,9 +628,14 @@ def parse_companies(xml):
         else:
             name = name_m.group(1).strip()
         guid_m = re.search(r'<GUID[^>]*>(.*?)</GUID>', block, re.I)
-        guid = guid_m.group(1).strip() if guid_m else ''
+        guid   = guid_m.group(1).strip() if guid_m else ''
+        # Company number — uniquely tells apart same-name companies (e.g. 100002 vs 100010)
+        num_m  = re.search(r'<COMPANYNUMBER[^>]*>(.*?)</COMPANYNUMBER>', block, re.I)
+        if not num_m:
+            num_m = re.search(r'<BASICCOMPANYNUMBER[^>]*>(.*?)</BASICCOMPANYNUMBER>', block, re.I)
+        number = num_m.group(1).strip() if num_m else ''
         if name:
-            companies.append({'name': name, 'guid': guid})
+            companies.append({'name': name, 'guid': guid, 'number': number})
     return companies
 
 # ── Main GUI ──────────────────────────────────────────────────────────────────
@@ -1152,12 +1198,22 @@ class TallySyncApp:
             w.destroy()
         self.co_progress = {}
 
-        tally_by_guid = {co['guid']: co['name'] for co in self.companies if co.get('guid','')}
-        tally_names = {co['name'] for co in self.companies}
+        # Build compound key: GUID+number for same-name company disambiguation
+        tally_by_guid_num = {(co.get('guid',''), co.get('number','')): True for co in self.companies if co.get('guid','')}
+        tally_by_guid_map = {co.get('guid',''): co for co in self.companies if co.get('guid','')}
+        tally_names       = {co['name'] for co in self.companies}
+
         def _co_is_open(a):
-            g = a.get('tally_guid','')
-            if g and g in tally_by_guid: return True
-            return a.get('name','') in tally_names
+            ag = a.get('tally_guid','')
+            an = a.get('tally_number','')
+            if ag and an and (ag, an) in tally_by_guid_num:
+                return True
+            if ag and ag in tally_by_guid_map:
+                tc = tally_by_guid_map[ag]
+                if an and tc.get('number','') and an != tc.get('number',''):
+                    return False  # same GUID but different number = different company
+                return True
+            return not ag and a.get('name','') in tally_names
 
         if len(self.assigned) > 1:
             self.btn_sync_all.config(text='▶  Sync All')
@@ -1172,6 +1228,10 @@ class TallySyncApp:
             )
             for a in self.assigned:
                 cname      = a['name']
+                # Show number suffix if two assigned companies share the same name
+                same_count = sum(1 for x in self.assigned if x['name'] == cname)
+                if same_count > 1 and a.get('tally_number',''):
+                    cname = f"{cname}  [{a['tally_number']}]"
                 is_open    = _co_is_open(a)   # is the company open in TallyPrime right now?
 
                 # ── Separator ────────────────────────────────────────────────
@@ -1335,15 +1395,19 @@ class TallySyncApp:
         self.root.after(0, lambda: self.btn_sync_all.config(state='disabled'))
         self.root.after(0, lambda: self.btn_stop.config(state='normal'))
         try:
-            # Match by GUID first (handles same-name companies), then by name fallback
-            tally_by_guid = {co['guid']: co['name'] for co in self.companies if co.get('guid','')}
-            tally_names   = {co['name'] for co in self.companies}
-            def _is_open(assigned_co):
-                g = assigned_co.get('tally_guid','')
-                if g and g in tally_by_guid:
+            # GUID+number matching to handle same-name companies (100002 vs 100010)
+            tally_by_guid_num2 = {(co.get('guid',''), co.get('number','')): True for co in self.companies if co.get('guid','')}
+            tally_by_guid_map2 = {co.get('guid',''): co for co in self.companies if co.get('guid','')}
+            tally_names        = {co['name'] for co in self.companies}
+            def _sa_is_open(a):
+                ag = a.get('tally_guid',''); an = a.get('tally_number','')
+                if ag and an and (ag, an) in tally_by_guid_num2: return True
+                if ag and ag in tally_by_guid_map2:
+                    tc = tally_by_guid_map2[ag]
+                    if an and tc.get('number','') and an != tc.get('number',''): return False
                     return True
-                return assigned_co.get('name','') in tally_names
-            syncable    = [co for co in self.assigned if _is_open(co)]
+                return not ag and a.get('name','') in tally_names
+            syncable    = [co for co in self.assigned if _sa_is_open(co)]
             total       = len(syncable)
             for idx, co in enumerate(syncable, 1):
                 if self.stop_flag:
@@ -1410,12 +1474,22 @@ class TallySyncApp:
             sec          = _gcfg('secret_key', '')
 
         # ── Skip if company is not open in TallyPrime right now ──────────────
-        # Match by GUID first (correct for same-name companies), name as fallback
-        tally_by_guid = {co['guid']: co['name'] for co in self.companies if co.get('guid','')}
-        tally_names   = {co['name'] for co in self.companies}
-        assigned_guid = company.get('tally_guid','') if isinstance(company, dict) else ''
-        is_open = (assigned_guid and assigned_guid in tally_by_guid) or (company_name in tally_names)
-        if company_name and not is_open:
+        # Match by GUID+number to correctly handle same-name companies (100002 vs 100010)
+        assigned_guid   = company.get('tally_guid','')   if isinstance(company, dict) else ''
+        assigned_number = company.get('tally_number','') if isinstance(company, dict) else ''
+        tally_by_guid_n = {(co.get('guid',''), co.get('number','')): True for co in self.companies if co.get('guid','')}
+        tally_by_guid_s = {co.get('guid',''): co for co in self.companies if co.get('guid','')}
+        tally_names     = {co['name'] for co in self.companies}
+        def _this_co_open():
+            if assigned_guid and assigned_number and (assigned_guid, assigned_number) in tally_by_guid_n:
+                return True
+            if assigned_guid and assigned_guid in tally_by_guid_s:
+                tc = tally_by_guid_s[assigned_guid]
+                if assigned_number and tc.get('number','') and assigned_number != tc.get('number',''):
+                    return False
+                return True
+            return not assigned_guid and company_name in tally_names
+        if company_name and not _this_co_open():
             self.log_append(
                 f'Skipping "{company_name}" — not currently open in TallyPrime.', 'warn')
             self._co_progress(company_name, 0, 'Skipped — not open in Tally')
@@ -1652,6 +1726,34 @@ class TallySyncApp:
                 if p and p.get('last_sync_lbl'):
                     try: p['last_sync_lbl'].config(text=f'Last sync: {t}')
                     except Exception: pass
+            # ── Voucher renumber check ───────────────────────────────────────
+            # Tally renumbers vouchers when one is inserted between existing entries.
+            # E.g. inserting between #2089 and #2090 makes #2089 become #2098.
+            # These old vouchers don't get a new alter_id so incremental sync misses them.
+            # Fix: fetch all GUID→number pairs for the current FY and update any mismatches.
+            try:
+                self.log_append('Checking for renumbered vouchers…', 'info')
+                self._co_progress(company_name, 95, 'Renumber check…')
+                fy_start = self.cfg.get('agent', 'fy_start') if self.cfg.has_option('agent','fy_start') else None
+                fy_end   = self.cfg.get('agent', 'fy_end')   if self.cfg.has_option('agent','fy_end')   else None
+                pairs = fetch_voucher_numbers_for_renumber(host, company=company_name,
+                                                           from_date=fy_start, to_date=fy_end)
+                if pairs:
+                    rnurl = renumber_vouchers_url(srv)
+                    rnres = simple_post(rnurl, {
+                        'company_key': company_key,
+                        'secret_key':  company_secret,
+                        'pairs_json':  json.dumps(pairs),
+                    }, timeout=30)
+                    upd = rnres.get('updated', 0) if isinstance(rnres, dict) else 0
+                    chk = rnres.get('checked', 0) if isinstance(rnres, dict) else 0
+                    if upd > 0:
+                        self.log_append(f'Renumber: {upd}/{chk} voucher numbers updated.', 'ok')
+                    else:
+                        self.log_append(f'Renumber: all {chk} numbers match ✓', 'info')
+            except Exception as rne:
+                self.log_append(f'Renumber check skipped: {rne}', 'warn')
+
             self.log_append('Sync complete ✓', 'ok')
             self._next_sync = time.time() + self._interval_secs()
             self.root.after(3000, _reset_to_idle)
