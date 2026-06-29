@@ -200,12 +200,17 @@ def collection_xml(name, typ, fields, fd='', td='', company=''):
 
 def fetch_companies(host):
     """
-    Fetch all open companies from TallyPrime.
-    Uses a custom TDL collection that retrieves NAME, GUID and the internal
-    company number (BASICCOMPANYNUMBER / $$CompanyNumber).
-    Falls back to a simpler query if TDL fails.
+    Fetch all open companies from TallyPrime with their data folder paths.
+
+    KEY INSIGHT: The data folder path is the ONLY reliable unique identifier.
+    Tally stores each company in a numbered subfolder:
+      D:\Tally.ERP9\Data\10002\  ← company number 100002
+      D:\Tally.ERP9\Data\10010\  ← company number 100010
+    The last folder segment = the company number. This is 100% reliable even
+    when GUID and Name are identical across companies.
+
+    We use $$DataPath as a COMPUTE field since it's not always in FETCH.
     """
-    # Custom TDL that exposes BASICCOMPANYNUMBER as a computed field
     tdl_xml = (
         '<ENVELOPE><HEADER><VERSION>1</VERSION>'
         '<TALLYREQUEST>Export</TALLYREQUEST>'
@@ -215,16 +220,25 @@ def fetch_companies(host):
         '</STATICVARIABLES><TDL><TDLMESSAGE>'
         '<COLLECTION NAME="BVPCoList" ISMODIFY="No">'
         '<TYPE>Company</TYPE>'
-        '<FETCH>NAME,GUID,COMPANYNUMBER,BASICCOMPANYNUMBER,COMPANYID</FETCH>'
+        '<FETCH>NAME,GUID,STARTINGFROM,ENDINGAT</FETCH>'
+        '<COMPUTE>BVPPATH:$$DataPath</COMPUTE>'
         '<COMPUTE>BVPNUM:$$CompanyNumber</COMPUTE>'
         '</COLLECTION></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>'
     )
     result = tally_post(host, tdl_xml, timeout=15)
+    # Save raw XML to log file for diagnostics (overwritten each Connect)
+    try:
+        import os, tempfile
+        log_path = os.path.join(tempfile.gettempdir(), 'bvp_tally_companies.xml')
+        with open(log_path, 'w', encoding='utf-8') as lf:
+            lf.write(result or 'EMPTY RESPONSE')
+    except Exception:
+        pass
     if result and '<COMPANY' in result.upper():
         return result
-    # Fallback: simpler fetch without computed field
+    # Fallback: plain fetch without computed fields
     return tally_post(host, collection_xml('TSCo','Company',
-        ['NAME','GUID','BASICCOMPANYNUMBER','COMPANYNUMBER']), timeout=15)
+        ['NAME','GUID','STARTINGFROM','ENDINGAT']), timeout=15)
 
 def fetch_ledgers(host, company=''):
     return tally_post(host, collection_xml('TSLed','Ledger',
@@ -629,7 +643,7 @@ def discover_companies_on_server(server_url, master_key, master_secret, companie
         'master_key': master_key,
         'master_secret': master_secret,
         'action': 'discover',
-        'companies_json': json.dumps([{'name': c['name'], 'guid': c.get('guid',''), 'number': c.get('number','')} for c in companies]),
+        'companies_json': json.dumps([{'name': c['name'], 'guid': c.get('guid',''), 'number': c.get('number',''), 'path': c.get('path','')} for c in companies]),
     })
 
 def list_assigned_companies(server_url, master_key, master_secret):
@@ -1113,6 +1127,12 @@ class TallySyncApp:
                 cos = [{'name':'(Company open in Tally)','guid':''}]
             self.companies = cos
             self.log_append(f'TallyPrime: found {len(cos)} compan{"y" if len(cos)==1 else "ies"}', 'ok')
+            # Log parsed company details for diagnostics
+            for _co in cos:
+                _num = _co.get('number','?')
+                _path = _co.get('path','')
+                _pathshort = _path[-30:] if len(_path) > 30 else _path
+                self.log_append(f'  • {_co["name"]}  [#{_num}]  {_pathshort}', 'dim')
 
             self.assigned = []
             self.pending_setup = False
@@ -1229,13 +1249,19 @@ class TallySyncApp:
         self.co_progress = {}
 
         # ── Open-company check ──────────────────────────────────────────────
-        # GUID is NOT reliable: all split-year versions of S.S. Electricals share
-        # the same GUID. NAME is the only unique key Tally enforces — it cannot
-        # have two companies with the same name open simultaneously.
-        # Therefore: a portal company is "open" iff its name is in the open set.
+        # PRIMARY KEY: tally_number (derived from data folder path).
+        #   Each company file lives in a unique numbered folder — 100002 vs 100010.
+        #   If we have the number, it's 100% unambiguous.
+        # FALLBACK: name — Tally cannot open two same-name companies simultaneously.
+        tally_by_number  = {co['number']: co for co in self.companies if co.get('number','')}
         tally_open_names = {co['name'] for co in self.companies}
 
         def _co_is_open(a):
+            portal_num = a.get('tally_number','')
+            # If portal has a stored number AND Tally reported numbers — use number match
+            if portal_num and tally_by_number:
+                return portal_num in tally_by_number
+            # Fallback: name match (when number not yet stored or Tally didn't return it)
             return a.get('name','') in tally_open_names
 
         if len(self.assigned) > 1:
@@ -1250,8 +1276,12 @@ class TallySyncApp:
                 key=lambda a: (0 if _co_is_open(a) else 1)
             )
             for a in self.assigned:
-                cname   = a['name']
-                is_open = _co_is_open(a)   # True iff this company name is open in Tally now
+                cname      = a['name']
+                num        = a.get('tally_number','')
+                # Show [number] suffix whenever we have it (makes same-name companies clear)
+                if num:
+                    cname = f'{cname}  [{num}]'
+                is_open    = _co_is_open(a)
 
                 # ── Separator ────────────────────────────────────────────────
                 sep = tk.Frame(self.co_frame, bg='#f3f4f6', height=1)
@@ -1414,9 +1444,15 @@ class TallySyncApp:
         self.root.after(0, lambda: self.btn_sync_all.config(state='disabled'))
         self.root.after(0, lambda: self.btn_stop.config(state='normal'))
         try:
-            # Name-based open check — name is the only reliable unique key in Tally
-            tally_open_names2 = {co['name'] for co in self.companies}
-            syncable = [co for co in self.assigned if co.get('name','') in tally_open_names2]
+            # Number-first open check (data-path derived number is reliable)
+            tally_by_num2    = {co['number']: co for co in self.companies if co.get('number','')}
+            tally_open_names2= {co['name'] for co in self.companies}
+            def _sa_open(a):
+                pn = a.get('tally_number','')
+                if pn and tally_by_num2:
+                    return pn in tally_by_num2
+                return a.get('name','') in tally_open_names2
+            syncable = [co for co in self.assigned if _sa_open(co)]
             total       = len(syncable)
             for idx, co in enumerate(syncable, 1):
                 if self.stop_flag:
@@ -1483,10 +1519,15 @@ class TallySyncApp:
             sec          = _gcfg('secret_key', '')
 
         # ── Skip if this company is not open in TallyPrime right now ───────
-        # NAME is the only reliable unique key — Tally cannot open two companies
-        # with the same name simultaneously, so name-match is always unambiguous.
-        tally_open_names_s = {co['name'] for co in self.companies}
-        if company_name and company_name not in tally_open_names_s:
+        # Use number (from data path) as primary key; name as fallback
+        tally_by_num_s    = {co['number']: co for co in self.companies if co.get('number','')}
+        tally_open_names_s= {co['name'] for co in self.companies}
+        portal_num_s      = company.get('tally_number','') if isinstance(company, dict) else ''
+        if portal_num_s and tally_by_num_s:
+            this_co_open = portal_num_s in tally_by_num_s
+        else:
+            this_co_open = company_name in tally_open_names_s
+        if company_name and not this_co_open:
             self.log_append(
                 f'Skipping "{company_name}" — not currently open in TallyPrime.', 'warn')
             self._co_progress(company_name, 0, 'Skipped — not open in Tally')
