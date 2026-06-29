@@ -289,44 +289,33 @@ def _get_company_number(host, company_name):
 
 def fetch_companies(host):
     """
-    Step 1: Get all company names via simple collection (always works).
-    Step 2: For each company, query its number individually.
-    Numbers come from Tally data folder paths (D:/Tally/Data/10002/).
+    Fetch all open companies in ONE request, no SVCURRENTCOMPANY.
+    SVCURRENTCOMPANY is broken when multiple companies are open — querying
+    per-company returns the ACTIVE company number for every row.
+    Single request with FETCH DATAPATH returns correct per-row data.
     """
-    import re
-    # Step 1: simple name+guid fetch
-    raw = tally_post(host, collection_xml('TSCo','Company',['NAME','GUID']), timeout=15)
+    import os, tempfile
+    xml = (
+        '<ENVELOPE><HEADER><VERSION>1</VERSION>'
+        '<TALLYREQUEST>Export</TALLYREQUEST>'
+        '<TYPE>Collection</TYPE><ID>BVPAllCo</ID></HEADER>'
+        '<BODY><DESC><STATICVARIABLES>'
+        '<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>'
+        '</STATICVARIABLES><TDL><TDLMESSAGE>'
+        '<COLLECTION NAME="BVPAllCo" ISMODIFY="No">'
+        '<TYPE>Company</TYPE>'
+        '<FETCH>NAME,GUID,COMPANYNUMBER,BASICCOMPANYNUMBER,'
+        'COMPANYID,DATAPATH,CMPDATAPATH,STARTINGFROM,ENDINGAT</FETCH>'
+        '</COLLECTION></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>'
+    )
+    raw = tally_post(host, xml, timeout=15)
     try:
-        import os, tempfile
-        with open(os.path.join(tempfile.gettempdir(), 'bvp_tally_companies.xml'), 'w', encoding='utf-8') as f:
-            f.write(raw or 'EMPTY')
+        log = os.path.join(tempfile.gettempdir(), 'bvp_tally_companies.xml')
+        with open(log, 'w', encoding='utf-8') as lf:
+            lf.write(raw or 'EMPTY')
     except Exception:
         pass
-    if not raw:
-        return raw
-
-    # Step 2: parse names
-    base = []
-    for m in re.finditer(r'<COMPANY\b[^>]*>(.*?)</COMPANY>', raw, re.S|re.I):
-        blk    = m.group(0)
-        nm     = re.search(r'NAME="([^"]+)"', blk, re.I)
-        if not nm:
-            nm = re.search(r'<NAME[^>]*>(.*?)</NAME>', blk, re.I)
-        name   = nm.group(1).strip() if nm else ''
-        gm     = re.search(r'<GUID[^>]*>(.*?)</GUID>', blk, re.I)
-        guid   = gm.group(1).strip() if gm else ''
-        if name:
-            base.append({'name': name, 'guid': guid})
-
-    # Step 3: enrich each with its number
-    result = []
-    for co in base:
-        number = _get_company_number(host, co['name'])
-        result.append({'name': co['name'], 'guid': co['guid'], 'number': number, 'path': ''})
-
-    global _fetched_companies_cache
-    _fetched_companies_cache = result
-    return '__BVP_DIRECT__'
+    return raw
 
 def fetch_ledgers(host, company=''):
     return tally_post(host, collection_xml('TSLed','Ledger',
@@ -743,34 +732,43 @@ def list_assigned_companies(server_url, master_key, master_secret):
         'action': 'list',
     })
 def parse_companies(xml):
+    """Parse company XML. Extracts number from DATAPATH per row (no SVCURRENTCOMPANY)."""
     import re
     global _fetched_companies_cache
     if xml == '__BVP_DIRECT__':
         return list(_fetched_companies_cache)
     companies = []
+    if not xml:
+        return companies
     for m in re.finditer(r'<COMPANY\b[^>]*>(.*?)</COMPANY>', xml, re.S|re.I):
         block = m.group(0)
-        name_m = re.search(r'NAME="([^"]+)"', block, re.I)
-        if not name_m:
-            name_m = re.search(r'<NAME[^>]*>(.*?)</NAME>', block, re.I)
-            name = name_m.group(1).strip() if name_m else ''
-        else:
-            name = name_m.group(1).strip()
-        guid_m = re.search(r'<GUID[^>]*>(.*?)</GUID>', block, re.I)
-        guid   = guid_m.group(1).strip() if guid_m else ''
-        # Company number — try every field name Tally may use
-        # Priority: BVPNUM (our computed field) > COMPANYNUMBER > BASICCOMPANYNUMBER > COMPANYID
+        nm = re.search(r'NAME="([^"]+)"', block, re.I)
+        if not nm:
+            nm = re.search(r'<NAME[^>]*>(.*?)</NAME>', block, re.I)
+        name = nm.group(1).strip() if nm else ''
+        if not name:
+            continue
+        gm = re.search(r'<GUID[^>]*>(.*?)</GUID>', block, re.I)
+        guid = gm.group(1).strip() if gm else ''
+        # Number: explicit fields first, then DATAPATH extraction
         number = ''
-        for tag in ['BVPNUM','COMPANYNUMBER','BASICCOMPANYNUMBER','COMPANYID']:
-            nm = re.search(rf'<{tag}[^>]*>(.*?)</{tag}>', block, re.I)
-            if nm:
-                val = nm.group(1).strip()
-                # Must be a numeric-looking value (company numbers are like 100002)
-                if val and re.match(r'^\d+$', val.strip()):
-                    number = val.strip()
-                    break
-        if name:
-            companies.append({'name': name, 'guid': guid, 'number': number})
+        for tag in ['COMPANYNUMBER', 'BASICCOMPANYNUMBER', 'COMPANYID']:
+            fm = re.search(rf'<{tag}[^>]*>(.*?)</{tag}>', block, re.I)
+            if fm:
+                val = fm.group(1).strip()
+                if re.match(r'^\d+$', val) and int(val) > 0:
+                    number = val; break
+        path = ''
+        if not number:
+            for tag in ['DATAPATH', 'CMPDATAPATH']:
+                pm = re.search(rf'<{tag}[^>]*>(.*?)</{tag}>', block, re.I)
+                if pm:
+                    path = pm.group(1).strip()
+                    for part in reversed(re.split(r'[/\\]', path)):
+                        if re.match(r'^\d{5,6}$', part.strip()):
+                            number = part.strip(); break
+                if number: break
+        companies.append({'name': name, 'guid': guid, 'number': number, 'path': path})
     return companies
 
 # ── Main GUI ──────────────────────────────────────────────────────────────────
@@ -1484,7 +1482,7 @@ class TallySyncApp:
                          bg='white', fg='#9ca3af',
                          font=('Segoe UI', 8)).pack(side='left', padx=(8, 0))
                 fill_id = canvas.create_rectangle(0, 0, 0, BAR_H, fill='#1464f4', outline='')
-                self.co_progress[cname] = {
+                _prog_entry = {
                     'canvas': canvas,
                     'fill':   fill_id,
                     'width':  BAR_W,
@@ -1492,6 +1490,8 @@ class TallySyncApp:
                     'is_open': is_open,
                     'last_sync_lbl': lbl_ls,
                 }
+                self.co_progress[cname] = _prog_entry           # display key (with [#number])
+                self.co_progress[a['name']] = _prog_entry       # raw name key (used by _co_progress)
 
         # ── Warning note for unselected/extra companies ───────────────────────
         if self.pending_setup or (self.assigned and len(self.companies) > len(self.assigned)):
