@@ -198,47 +198,135 @@ def collection_xml(name, typ, fields, fd='', td='', company=''):
             f'<TYPE>{typ}</TYPE><FETCH>{",".join(fields)}</FETCH>'
             f'</COLLECTION></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>')
 
-def fetch_companies(host):
-    """
-    Fetch all open companies from TallyPrime with their data folder paths.
+_fetched_companies_cache = []
 
-    KEY INSIGHT: The data folder path is the ONLY reliable unique identifier.
-    Tally stores each company in a numbered subfolder:
-      D:\Tally.ERP9\Data\10002\  ← company number 100002
-      D:\Tally.ERP9\Data\10010\  ← company number 100010
-    The last folder segment = the company number. This is 100% reliable even
-    when GUID and Name are identical across companies.
+def _get_company_number(host, company_name):
+    """Query Tally for one company's number using multiple TDL methods."""
+    import re
+    esc_name = escape(company_name)
 
-    We use $$DataPath as a COMPUTE field since it's not always in FETCH.
-    """
-    tdl_xml = (
+    # Method A: Collection filtered to this company, compute $$Number
+    xmlA = (
         '<ENVELOPE><HEADER><VERSION>1</VERSION>'
         '<TALLYREQUEST>Export</TALLYREQUEST>'
-        '<TYPE>Collection</TYPE><ID>BVPCoList</ID></HEADER>'
+        '<TYPE>Collection</TYPE><ID>BVPNumA</ID></HEADER>'
         '<BODY><DESC><STATICVARIABLES>'
         '<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>'
+        f'<SVCURRENTCOMPANY>{esc_name}</SVCURRENTCOMPANY>'
         '</STATICVARIABLES><TDL><TDLMESSAGE>'
-        '<COLLECTION NAME="BVPCoList" ISMODIFY="No">'
+        '<COLLECTION NAME="BVPNumA" ISMODIFY="No">'
         '<TYPE>Company</TYPE>'
-        '<FETCH>NAME,GUID,STARTINGFROM,ENDINGAT</FETCH>'
-        '<COMPUTE>BVPPATH:$$DataPath</COMPUTE>'
-        '<COMPUTE>BVPNUM:$$CompanyNumber</COMPUTE>'
-        '</COLLECTION></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>'
+        '<FETCH>NAME</FETCH>'
+        '<COMPUTE>N:$$String:$$Number</COMPUTE>'
+        '<COMPUTE>P:$$DataPath</COMPUTE>'
+        '</COLLECTION>'
+        '</TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>'
     )
-    result = tally_post(host, tdl_xml, timeout=15)
-    # Save raw XML to log file for diagnostics (overwritten each Connect)
     try:
-        import os, tempfile
-        log_path = os.path.join(tempfile.gettempdir(), 'bvp_tally_companies.xml')
-        with open(log_path, 'w', encoding='utf-8') as lf:
-            lf.write(result or 'EMPTY RESPONSE')
+        r = tally_post(host, xmlA, timeout=8)
+        if r:
+            # Save for diagnostics
+            import os, tempfile
+            safe = re.sub(r'[^a-zA-Z0-9]', '_', company_name[:25])
+            try:
+                with open(os.path.join(tempfile.gettempdir(), f'bvp_{safe}.xml'), 'w', encoding='utf-8') as f:
+                    f.write(r)
+            except Exception:
+                pass
+            # Try N field first
+            m = re.search(r'<N[^>]*>(.*?)</N>', r, re.I)
+            if m:
+                val = m.group(1).strip()
+                if re.match(r'^\d+$', val) and int(val) > 0:
+                    return val
+            # Try path-based extraction
+            pm = re.search(r'<P[^>]*>(.*?)</P>', r, re.I)
+            if pm:
+                path = pm.group(1).strip()
+                parts = re.split(r'[/\\]', path)
+                for part in reversed(parts):
+                    if re.match(r'^\d{5,6}$', part.strip()):
+                        return part.strip()
     except Exception:
         pass
-    if result and '<COMPANY' in result.upper():
-        return result
-    # Fallback: plain fetch without computed fields
-    return tally_post(host, collection_xml('TSCo','Company',
-        ['NAME','GUID','STARTINGFROM','ENDINGAT']), timeout=15)
+
+    # Method B: plain FETCH with standard field names
+    xmlB = (
+        '<ENVELOPE><HEADER><VERSION>1</VERSION>'
+        '<TALLYREQUEST>Export</TALLYREQUEST>'
+        '<TYPE>Collection</TYPE><ID>BVPNumB</ID></HEADER>'
+        '<BODY><DESC><STATICVARIABLES>'
+        '<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>'
+        f'<SVCURRENTCOMPANY>{esc_name}</SVCURRENTCOMPANY>'
+        '</STATICVARIABLES><TDL><TDLMESSAGE>'
+        '<COLLECTION NAME="BVPNumB" ISMODIFY="No">'
+        '<TYPE>Company</TYPE>'
+        '<FETCH>NAME,COMPANYNUMBER,BASICCOMPANYNUMBER,COMPANYID,DATAPATH,CMPDATAPATH</FETCH>'
+        '</COLLECTION>'
+        '</TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>'
+    )
+    try:
+        r = tally_post(host, xmlB, timeout=8)
+        if r:
+            for tag in ['COMPANYNUMBER','BASICCOMPANYNUMBER','COMPANYID']:
+                m = re.search(rf'<{tag}[^>]*>(.*?)</{tag}>', r, re.I)
+                if m:
+                    val = m.group(1).strip()
+                    if re.match(r'^\d+$', val) and int(val) > 0:
+                        return val
+            for tag in ['DATAPATH','CMPDATAPATH']:
+                m = re.search(rf'<{tag}[^>]*>(.*?)</{tag}>', r, re.I)
+                if m:
+                    path = m.group(1).strip()
+                    parts = re.split(r'[/\\]', path)
+                    for part in reversed(parts):
+                        if re.match(r'^\d{5,6}$', part.strip()):
+                            return part.strip()
+    except Exception:
+        pass
+    return ''
+
+
+def fetch_companies(host):
+    """
+    Step 1: Get all company names via simple collection (always works).
+    Step 2: For each company, query its number individually.
+    Numbers come from Tally data folder paths (D:/Tally/Data/10002/).
+    """
+    import re
+    # Step 1: simple name+guid fetch
+    raw = tally_post(host, collection_xml('TSCo','Company',['NAME','GUID']), timeout=15)
+    try:
+        import os, tempfile
+        with open(os.path.join(tempfile.gettempdir(), 'bvp_tally_companies.xml'), 'w', encoding='utf-8') as f:
+            f.write(raw or 'EMPTY')
+    except Exception:
+        pass
+    if not raw:
+        return raw
+
+    # Step 2: parse names
+    base = []
+    for m in re.finditer(r'<COMPANY\b[^>]*>(.*?)</COMPANY>', raw, re.S|re.I):
+        blk    = m.group(0)
+        nm     = re.search(r'NAME="([^"]+)"', blk, re.I)
+        if not nm:
+            nm = re.search(r'<NAME[^>]*>(.*?)</NAME>', blk, re.I)
+        name   = nm.group(1).strip() if nm else ''
+        gm     = re.search(r'<GUID[^>]*>(.*?)</GUID>', blk, re.I)
+        guid   = gm.group(1).strip() if gm else ''
+        if name:
+            base.append({'name': name, 'guid': guid})
+
+    # Step 3: enrich each with its number
+    result = []
+    for co in base:
+        number = _get_company_number(host, co['name'])
+        result.append({'name': co['name'], 'guid': co['guid'], 'number': number, 'path': ''})
+
+    global _fetched_companies_cache
+    _fetched_companies_cache = result
+    return '__BVP_DIRECT__'
 
 def fetch_ledgers(host, company=''):
     return tally_post(host, collection_xml('TSLed','Ledger',
@@ -656,6 +744,9 @@ def list_assigned_companies(server_url, master_key, master_secret):
     })
 def parse_companies(xml):
     import re
+    global _fetched_companies_cache
+    if xml == '__BVP_DIRECT__':
+        return list(_fetched_companies_cache)
     companies = []
     for m in re.finditer(r'<COMPANY\b[^>]*>(.*?)</COMPANY>', xml, re.S|re.I):
         block = m.group(0)
