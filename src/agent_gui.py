@@ -1252,6 +1252,8 @@ class TallySyncApp:
                         f'Portal: {len(self.assigned)}/{plan.get("max_companies","?")} companies active'
                         + (f', {extra} more available: {extra_names}' if extra else ''), 'info')
                     self._sync_watermarks_from_server()
+                    # Migrate old name-based config keys → new id-based keys
+                    self._migrate_config_keys()
                 else:
                     self.log_append(f'Could not load company list from portal: {list_res.get("error")}', 'warn')
             elif not (mkey and msec):
@@ -1264,6 +1266,51 @@ class TallySyncApp:
         except Exception as e:
             self._set_status(f'Not connected: {str(e)[:55]}', '#f87171')
             self.log_append(f'Connect failed: {e}', 'error')
+
+    def _migrate_config_keys(self):
+        """
+        Migrate old name-based config keys to new id-based keys.
+        Old: last_voucher_alterid__s.s. electricals (from 1-apr-26) = 83675
+        New: last_voucher_alterid__id11 = 83675
+        Runs once after connect so sync continues from correct watermarks.
+        """
+        import re as _re
+        changed = False
+        for a in self.assigned:
+            cid  = str(a.get('company_id', ''))
+            name = a.get('name', '').lower()
+            if not cid or not name:
+                continue
+            for prefix in ('last_voucher_alterid__', 'last_master_alterid__',
+                           'ledger_hash__', 'stock_hash__', 'co_paused__'):
+                new_key = f'{prefix}id{cid}'
+                # Build candidate old-style key variants
+                old_keys = [
+                    prefix + name,                                           # space-based
+                    prefix + _re.sub(r'[\s/]', '_', name),                 # underscored
+                    prefix + _re.sub(r'[^a-z0-9]', '_', name),             # fully sanitized
+                    prefix + _re.sub(r'[^a-z0-9_.\s()/\-]', '_', name),  # partial
+                ]
+                if self.cfg.has_option('agent', new_key) and                    self.cfg.get('agent', new_key).strip():
+                    continue  # already set, skip
+                for old_key in old_keys:
+                    if self.cfg.has_option('agent', old_key):
+                        val = self.cfg.get('agent', old_key).strip()
+                        if val:
+                            self.cfg.set('agent', new_key, val)
+                            changed = True
+                            self.log_append(
+                                f'Migrated config: {old_key} → {new_key} = {val}', 'dim')
+                            break
+        if changed:
+            try:
+                import os
+                cfg_path = os.path.join(
+                    os.environ.get('APPDATA', ''), 'TallySync', 'config.ini')
+                with open(cfg_path, 'w', encoding='utf-8') as cf:
+                    self.cfg.write(cf)
+            except Exception as ex:
+                self.log_append(f'Config save error: {ex}', 'warn')
 
     def _set_status(self, msg, color):
         self.root.after(0, lambda: self.lbl_status.config(text=msg, fg=color, bg='#eef4ff'))
@@ -1611,11 +1658,15 @@ class TallySyncApp:
             key          = _gcfg('api_key', '')
             sec          = _gcfg('secret_key', '')
 
+        # Helper: update THIS company's progress bar by company_id (unique per company)
+        # Defined FIRST so it can be used in the skip block below too
+        def _prog(pct, msg=''):
+            self._co_progress(company_name, pct, msg, company_id=uid)
+
         # ── Skip if this company is not open in TallyPrime right now ───────
-        # Use number (from data path) as primary key; name as fallback
-        tally_by_num_s    = {co['number']: co for co in self.companies if co.get('number','')}
-        tally_open_names_s= {co['name'] for co in self.companies}
-        portal_num_s      = company.get('tally_number','') if isinstance(company, dict) else ''
+        tally_by_num_s     = {co['number']: co for co in self.companies if co.get('number','')}
+        tally_open_names_s = {co['name'] for co in self.companies}
+        portal_num_s       = company.get('tally_number','') if isinstance(company, dict) else ''
         if portal_num_s and tally_by_num_s:
             this_co_open = portal_num_s in tally_by_num_s
         else:
@@ -1623,21 +1674,17 @@ class TallySyncApp:
         if company_name and not this_co_open:
             self.log_append(
                 f'Skipping "{company_name}" — not currently open in TallyPrime.', 'warn')
-            _prog( 0, 'Skipped — not open in Tally')
+            _prog(0, 'Skipped — not open in Tally')
             return
 
         self.log_append(f'Syncing "{company_name}" #{portal_num_s} (id={uid})', 'info')
         cmp_    = _gcfg('compress', 'true').lower() == 'true'
         enc_    = _gcfg('encrypt',  'true').lower() == 'true'
-        company = company_name   # used for Tally XML context — must be the exact open name
+        company = company_name   # used for Tally XML context
 
         if not uid or not srv:
             self.log_append('ERROR: Agent not configured. Contact your TallySync admin.','error')
             return
-
-        # Helper: update THIS company's progress bar by company_id (unique even for same names)
-        def _prog(pct, msg=''):
-            _prog( pct, msg, company_id=uid)
 
         try:
             # ── 1 & 2. Masters (Ledgers + Stock) — Incremental via AlterID ────
