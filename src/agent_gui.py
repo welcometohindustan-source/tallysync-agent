@@ -1490,8 +1490,10 @@ class TallySyncApp:
                     'is_open': is_open,
                     'last_sync_lbl': lbl_ls,
                 }
-                self.co_progress[cname] = _prog_entry           # display key (with [#number])
-                self.co_progress[a['name']] = _prog_entry       # raw name key (used by _co_progress)
+                # Key by company_id (unique) — prevents same-name companies sharing a bar
+                _co_id = str(a.get('company_id', '')) or cname
+                self.co_progress[_co_id] = _prog_entry     # primary key used by _co_progress
+                self.co_progress[cname]  = _prog_entry     # display key for reference
 
         # ── Warning note for unselected/extra companies ───────────────────────
         if self.pending_setup or (self.assigned and len(self.companies) > len(self.assigned)):
@@ -1621,22 +1623,26 @@ class TallySyncApp:
         if company_name and not this_co_open:
             self.log_append(
                 f'Skipping "{company_name}" — not currently open in TallyPrime.', 'warn')
-            self._co_progress(company_name, 0, 'Skipped — not open in Tally')
+            _prog( 0, 'Skipped — not open in Tally')
             return
 
-        self.log_append(f'Syncing "{company_name}" (company_id={uid})', 'info')
+        self.log_append(f'Syncing "{company_name}" #{portal_num_s} (id={uid})', 'info')
         cmp_    = _gcfg('compress', 'true').lower() == 'true'
         enc_    = _gcfg('encrypt',  'true').lower() == 'true'
-        company = company_name
+        company = company_name   # used for Tally XML context — must be the exact open name
 
         if not uid or not srv:
             self.log_append('ERROR: Agent not configured. Contact your TallySync admin.','error')
             return
 
+        # Helper: update THIS company's progress bar by company_id (unique even for same names)
+        def _prog(pct, msg=''):
+            _prog( pct, msg, company_id=uid)
+
         try:
             # ── 1 & 2. Masters (Ledgers + Stock) — Incremental via AlterID ────
-            # First sync: full master download. Subsequent: only changed masters.
-            master_key = 'last_master_alterid__' + re.sub(r'[/\\\s]', '_', company_name) if company_name else 'last_master_alterid'
+            # Use company_id in the key — prevents same-name companies sharing a watermark
+            master_key = f'last_master_alterid__id{uid}' if uid else 'last_master_alterid'
             last_master_alterid = 0
             if self.cfg.has_option('agent', master_key):
                 try: last_master_alterid = int(self.cfg.get('agent', master_key).strip() or '0')
@@ -1646,7 +1652,7 @@ class TallySyncApp:
             max_master_alterid   = last_master_alterid
 
             # ── 1. Ledgers ────────────────────────────────────────────────────
-            self._co_progress(company_name, 5,
+            _prog( 5,
                 'Fetching all ledgers (first sync)…' if is_first_master_sync
                 else f'Checking ledger changes since AlterID {last_master_alterid}…')
             if is_first_master_sync:
@@ -1665,7 +1671,7 @@ class TallySyncApp:
                 if new_max > max_master_alterid:
                     max_master_alterid = new_max
                 mode_label = 'full' if is_first_master_sync else f'incremental (AlterID>{last_master_alterid})'
-                self._co_progress(company_name, 12, 'Sending ledgers…')
+                _prog( 12, 'Sending ledgers…')
                 bundle = build_bundle(uid, 'ledgers', xml)
                 res    = send_bundle(srv, uid, key, bundle, cmp_, enc_, sec, extra=extra)
                 saved  = res.get('saved', 0) if res.get('ok') else 0
@@ -1681,10 +1687,10 @@ class TallySyncApp:
 
             if self.stop_flag: raise Exception('Stopped')
             time.sleep(0.5)
-            self._co_progress(company_name, 20, 'Ledgers done.')
+            _prog( 20, 'Ledgers done.')
 
             # ── 2. Stock Items ────────────────────────────────────────────────
-            self._co_progress(company_name, 22,
+            _prog( 22,
                 'Fetching all stock items (first sync)…' if is_first_master_sync
                 else f'Checking stock changes since AlterID {last_master_alterid}…')
             if is_first_master_sync:
@@ -1703,7 +1709,7 @@ class TallySyncApp:
                 if new_max > max_master_alterid:
                     max_master_alterid = new_max
                 mode_label = 'full' if is_first_master_sync else f'incremental (AlterID>{last_master_alterid})'
-                self._co_progress(company_name, 28, 'Sending stock…')
+                _prog( 28, 'Sending stock…')
                 bundle = build_bundle(uid, 'stock', xml)
                 res    = send_bundle(srv, uid, key, bundle, cmp_, enc_, sec, extra=extra_s)
                 saved  = res.get('saved', 0) if res.get('ok') else 0
@@ -1719,7 +1725,7 @@ class TallySyncApp:
 
             if self.stop_flag: raise Exception('Stopped')
             time.sleep(0.5)
-            self._co_progress(company_name, 35, 'Masters done.')
+            _prog( 35, 'Masters done.')
 
             # ── Save master AlterID watermark ─────────────────────────────────
             if max_master_alterid > last_master_alterid:
@@ -1730,7 +1736,7 @@ class TallySyncApp:
                 self.log_append(f'Master AlterID watermark updated: {last_master_alterid} → {max_master_alterid}', 'dim')
 
             # ── 3. Vouchers ──────────────────────────────────────────────────
-            alterid_key = ('last_voucher_alterid__' + re.sub(r'[/\\\s]', '_', company_name)) if company_name else 'last_voucher_alterid'
+            alterid_key = (f'last_voucher_alterid__id{uid}') if company_name else 'last_voucher_alterid'
             last_alterid = 0
             if self.cfg.has_option('agent', alterid_key):
                 try: last_alterid = int(self.cfg.get('agent', alterid_key).strip() or '0')
@@ -1758,7 +1764,7 @@ class TallySyncApp:
                     sent_so_far += bn
                     pct = 40 + int(50 * (bi + 1) / n)
                     # Show e.g. "500 of 1473" or "3 of 3"
-                    self._co_progress(company_name, pct, f'Vouchers {sent_so_far} of {total_vch}…')
+                    _prog( pct, f'Vouchers {sent_so_far} of {total_vch}…')
                     is_first = '1' if (is_first_batch_clears and bi == 0) else '0'
                     bundle   = build_bundle(uid, 'vouchers', bxml, meta={'from_date':'', 'to_date':''})
                     res      = send_bundle(srv, uid, key, bundle, cmp_, enc_, sec, extra={'is_first':is_first})
@@ -1777,7 +1783,7 @@ class TallySyncApp:
 
             if last_alterid > 0:
                 if self.stop_flag: raise Exception('Stopped')
-                self._co_progress(company_name, 40, 'Checking changes…')
+                _prog( 40, 'Checking changes…')
                 self.log_append(f'Incremental sync from AlterID {last_alterid} — fetching new/edited vouchers...', 'info')
                 xml = fetch_vouchers_by_alterid(host, last_alterid, company=company or '')
                 if '<LINEERROR>' in xml.upper():
@@ -1815,10 +1821,10 @@ class TallySyncApp:
                         self.log_append(f'Historical check skipped: {e_hist}', 'dim')
                 else:
                     self.log_append('No new or edited vouchers since last sync.', 'dim')
-                    self._co_progress(company_name, 90, 'No changes.')
+                    _prog( 90, 'No changes.')
             else:
                 if self.stop_flag: raise Exception('Stopped')
-                self._co_progress(company_name, 40, 'Fetching all vouchers (all years)…')
+                _prog( 40, 'Fetching all vouchers (all years)…')
                 self.log_append('First sync — fetching complete voucher history across ALL financial years...', 'info')
                 self.log_append('⚠  This may take several minutes for large companies. Stop takes effect after Tally responds.', 'dim')
                 xml = fetch_all_vouchers_unfiltered(host, company=company or '', timeout=1800)
@@ -1845,7 +1851,7 @@ class TallySyncApp:
                 self.cfg.set('agent', alterid_key, str(max_alterid_seen))
                 save_cfg(self.cfg)
 
-            self._co_progress(company_name, 100, 'Done ✓')
+            _prog( 100, 'Done ✓')
             now_str = datetime.now().strftime('%d %b %Y, %H:%M')
             # Update the per-company last-sync label when bar resets to Idle
             def _reset_to_idle(n=company_name, t=now_str):
@@ -1862,7 +1868,7 @@ class TallySyncApp:
             # Fix: fetch all GUID→number pairs for the current FY and update any mismatches.
             try:
                 self.log_append('Checking for renumbered vouchers…', 'info')
-                self._co_progress(company_name, 95, 'Renumber check…')
+                _prog( 95, 'Renumber check…')
                 fy_start = self.cfg.get('agent', 'fy_start') if self.cfg.has_option('agent','fy_start') else None
                 fy_end   = self.cfg.get('agent', 'fy_end')   if self.cfg.has_option('agent','fy_end')   else None
                 pairs = fetch_voucher_numbers_for_renumber(host, company=company_name,
@@ -1889,16 +1895,19 @@ class TallySyncApp:
 
         except Exception as e:
             self.log_append(f'Sync error: {e}', 'error')
-            self._co_progress(company_name, 0, 'Error')
+            _prog( 0, 'Error')
 
     def _sync_done(self):
         self.syncing = False
         self.root.after(0, lambda: self.btn_sync_all.config(state='normal'))
         self.root.after(0, lambda: self.btn_stop.config(state='disabled', text='⏹  Stop'))
 
-    def _co_progress(self, company_name, pct, status=''):
-        """Update the thin per-company Canvas progress bar (0–100)."""
-        p = self.co_progress.get(company_name)
+    def _co_progress(self, company_name, pct, status='', company_id=''):
+        """Update the thin per-company Canvas progress bar (0–100).
+        Looks up by company_id first (unique), falls back to name."""
+        p = self.co_progress.get(str(company_id)) if company_id else None
+        if not p:
+            p = self.co_progress.get(company_name)
         if not p:
             return
         bar_w = int(p['width'] * max(0, min(100, pct)) / 100)
