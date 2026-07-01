@@ -1267,6 +1267,40 @@ class TallySyncApp:
             self._set_status(f'Not connected: {str(e)[:55]}', '#f87171')
             self.log_append(f'Connect failed: {e}', 'error')
 
+    def _force_full_resync(self, company):
+        """Clear local watermarks for this company and trigger a full resync."""
+        cid  = str(company.get('company_id',''))
+        name = company.get('name','')
+        cnum = company.get('tally_number','')
+        label = f"{name} [{cnum}]" if cnum else name
+
+        if not messagebox.askyesno(
+            'Force Full Resync',
+            f'Clear all local sync watermarks for:\n\n  {label}\n\n'
+            f'This will re-send ALL ledgers, stock items and vouchers to the\n'
+            f'portal on the next sync. Use this after resetting server data.\n\n'
+            f'Continue?', icon='warning'):
+            return
+
+        changed = False
+        for prefix in ('last_voucher_alterid__', 'last_master_alterid__',
+                       'ledger_hash__', 'stock_hash__'):
+            key_ = f'{prefix}id{cid}'
+            if self.cfg.has_option('agent', key_):
+                self.cfg.set('agent', key_, '0')
+                changed = True
+
+        if changed:
+            save_cfg(self.cfg)
+            self.log_append(
+                f'Watermarks cleared for "{label}" — next sync will be a FULL resync.', 'ok')
+            messagebox.showinfo(
+                'Watermarks Cleared',
+                f'Full resync scheduled for:\n  {label}\n\n'
+                f'Click Sync Now to start.')
+        else:
+            self.log_append(f'No watermarks found for "{label}" — already reset.', 'info')
+
     def _migrate_config_keys(self):
         """
         Migrate old name-based config keys to new id-based keys.
@@ -1466,7 +1500,8 @@ class TallySyncApp:
                 btn_clr = 'primary' if is_open else 'light'
 
                 # ── Per-company pause state (stored in config.ini) ────────────
-                co_pause_key = f'co_paused__{re.sub(chr(47), "_", cname)}'
+                _co_id_str   = str(a.get('company_id',''))
+                co_pause_key = f'co_paused__id{_co_id_str}' if _co_id_str else f'co_paused__{re.sub(chr(47), "_", a["name"])}'
                 co_is_paused = (
                     self.cfg.has_option('agent', co_pause_key) and
                     self.cfg.get('agent', co_pause_key).strip() == '1'
@@ -1489,6 +1524,27 @@ class TallySyncApp:
                         # Rebuild UI to reflect new button state
                         self.root.after(0, self._render_companies)
                     return _toggle
+
+                # ── Right-click context menu ─────────────────────────────────
+                def _make_context_menu(co_=co, cname_=cname, is_open_=is_open):
+                    menu = tk.Menu(self.root, tearoff=0)
+                    if is_open_:
+                        menu.add_command(
+                            label='▶  Sync Now (Incremental)',
+                            command=lambda: threading.Thread(
+                                target=self._do_sync_one, kwargs={'company': co_},
+                                daemon=True).start())
+                        menu.add_separator()
+                        menu.add_command(
+                            label='⟳  Force Full Resync (clear watermark)',
+                            command=lambda: self._force_full_resync(co_))
+                    else:
+                        menu.add_command(
+                            label=f'Company not open in Tally', state='disabled')
+                    return menu
+                def _show_ctx(event, co_=co, cname_=cname, is_open_=is_open):
+                    _make_context_menu(co_, cname_, is_open_).tk_popup(event.x_root, event.y_root)
+                row.bind('<Button-3>', _show_ctx)
 
                 # Sync Now button (right side)
                 sync_btn = self._btn(row, '▶ Sync Now',
@@ -1841,31 +1897,12 @@ class TallySyncApp:
                     self.log_append(f'{vch_count} new/edited voucher(s) found since AlterID {last_alterid}', 'info')
                     send_voucher_batches(xml, is_first_batch_clears=False)
 
-                    # ── Also scan PREVIOUS financial years to catch old vouchers ──
-                    # This catches vouchers from companies that were synced to a
-                    # different server (localhost vs bizviewpro.in)
-                    # We check if server has vouchers for all years back to company start
-                    try:
-                        # Get earliest voucher date from server to detect missing years
-                        earliest_bundle = build_bundle(uid, 'get_earliest_date', '', meta={})
-                        earliest_res    = send_bundle(srv, uid, key, earliest_bundle, cmp_, enc_, sec)
-                        server_earliest = earliest_res.get('earliest_date', '') if earliest_res.get('ok') else ''
-                        # Get Tally's earliest voucher date
-                        tally_earliest_xml = fetch_all_vouchers_unfiltered(
-                            host, company=company or '', timeout=300,
-                            date_filter='from_start'
-                        )
-                        t_dmin, _ = extract_date_range(tally_earliest_xml)
-                        if t_dmin and server_earliest and t_dmin < server_earliest[:8].replace('-',''):
-                            # Tally has older data than server — send it
-                            self.log_append(
-                                f'Found older Tally data ({t_dmin}) not on server (server from {server_earliest}) — syncing historical data...', 'warn'
-                            )
-                            hist_count = count_vouchers(tally_earliest_xml)
-                            if hist_count > 0:
-                                send_voucher_batches(tally_earliest_xml, is_first_batch_clears=False)
-                    except Exception as e_hist:
-                        self.log_append(f'Historical check skipped: {e_hist}', 'dim')
+                    # (Historical-year backfill check removed — it was dead code:
+                    #  'get_earliest_date' was never implemented server-side and
+                    #  always failed with "Empty xml in bundle", adding log noise
+                    #  with no actual effect. If you need to backfill older years
+                    #  after a server data reset, use "Force Full Resync" instead
+                    #  of relying on this automatic check.)
                 else:
                     self.log_append('No new or edited vouchers since last sync.', 'dim')
                     _prog( 90, 'No changes.')
@@ -1923,8 +1960,8 @@ class TallySyncApp:
                 if pairs:
                     rnurl = renumber_vouchers_url(srv)
                     rnres = simple_post(rnurl, {
-                        'company_key': company_key,
-                        'secret_key':  company_secret,
+                        'company_key': key,
+                        'secret_key':  sec,
                         'pairs_json':  json.dumps(pairs),
                     }, timeout=30)
                     upd = rnres.get('updated', 0) if isinstance(rnres, dict) else 0
