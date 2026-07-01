@@ -1297,7 +1297,9 @@ class TallySyncApp:
             messagebox.showinfo(
                 'Watermarks Cleared',
                 f'Full resync scheduled for:\n  {label}\n\n'
-                f'Click Sync Now to start.')
+                f'Click Sync Now to start, or wait for auto-sync.')
+            # Re-render so UI reflects cleared state
+            self.root.after(100, self._render_companies)
         else:
             self.log_append(f'No watermarks found for "{label}" — already reset.', 'info')
 
@@ -1544,7 +1546,14 @@ class TallySyncApp:
                     return menu
                 def _show_ctx(event, co_=co, cname_=cname, is_open_=is_open):
                     _make_context_menu(co_, cname_, is_open_).tk_popup(event.x_root, event.y_root)
-                row.bind('<Button-3>', _show_ctx)
+                # Bind right-click to the row AND all its child widgets
+                # (child widgets consume click events and don't bubble up in tkinter)
+                def _bind_ctx_recursive(widget, fn):
+                    widget.bind('<Button-3>', fn)
+                    for child in widget.winfo_children():
+                        _bind_ctx_recursive(child, fn)
+                # Schedule after widget is fully built
+                row.after(50, lambda r=row, fn=_show_ctx: _bind_ctx_recursive(r, fn))
 
                 # Sync Now button (right side)
                 sync_btn = self._btn(row, '▶ Sync Now',
@@ -1935,28 +1944,27 @@ class TallySyncApp:
                 self.cfg.set('agent', alterid_key, str(max_alterid_seen))
                 save_cfg(self.cfg)
 
-            _prog( 100, 'Done ✓')
             now_str = datetime.now().strftime('%d %b %Y, %H:%M')
-            # Update the per-company last-sync label when bar resets to Idle
-            def _reset_to_idle(n=company_name, t=now_str):
-                self._co_progress(n, 0, 'Idle')
-                # Refresh the company list so last-sync label updates
-                p = self.co_progress.get(n)
+            def _reset_to_idle(n=company_name, t=now_str, cid=uid):
+                self._co_progress(n, 0, 'Idle', company_id=cid)
+                p = self.co_progress.get(str(cid)) or self.co_progress.get(n)
                 if p and p.get('last_sync_lbl'):
                     try: p['last_sync_lbl'].config(text=f'Last sync: {t}')
                     except Exception: pass
-            # ── Voucher renumber check ───────────────────────────────────────
-            # Tally renumbers vouchers when one is inserted between existing entries.
-            # E.g. inserting between #2089 and #2090 makes #2089 become #2098.
-            # These old vouchers don't get a new alter_id so incremental sync misses them.
-            # Fix: fetch all GUID→number pairs for the current FY and update any mismatches.
+
+            # ── Voucher renumber check ────────────────────────────────────────
+            # Only run for incremental syncs (skip after full first-sync to save time)
+            # Renumber check: Tally renumbers vouchers when one is inserted between
+            # existing ones — these don't get a new AlterID so incremental misses them.
+            _ran_renumber = False
             try:
+                _prog(95, 'Renumber check…')
                 self.log_append('Checking for renumbered vouchers…', 'info')
-                _prog( 95, 'Renumber check…')
                 fy_start = self.cfg.get('agent', 'fy_start') if self.cfg.has_option('agent','fy_start') else None
                 fy_end   = self.cfg.get('agent', 'fy_end')   if self.cfg.has_option('agent','fy_end')   else None
-                pairs = fetch_voucher_numbers_for_renumber(host, company=company_name,
-                                                           from_date=fy_start, to_date=fy_end)
+                pairs = fetch_voucher_numbers_for_renumber(
+                    host, company=company_name, from_date=fy_start, to_date=fy_end)
+                _ran_renumber = True
                 if pairs:
                     rnurl = renumber_vouchers_url(srv)
                     rnres = simple_post(rnurl, {
@@ -1973,9 +1981,11 @@ class TallySyncApp:
             except Exception as rne:
                 self.log_append(f'Renumber check skipped: {rne}', 'warn')
 
+            # ── Sync complete ─────────────────────────────────────────────────
+            _prog(100, 'Sync complete ✓')
             self.log_append('Sync complete ✓', 'ok')
             self._next_sync = time.time() + self._interval_secs()
-            self.root.after(3000, _reset_to_idle)
+            self.root.after(2000, _reset_to_idle)
 
         except Exception as e:
             self.log_append(f'Sync error: {e}', 'error')
