@@ -497,13 +497,17 @@ def fetch_voucher_numbers_for_renumber(host, company='', from_date=None, to_date
     return pairs
 
 def fetch_all_vouchers_unfiltered(host, company='', timeout=1800):
-    """Fetch ALL vouchers for a company in ONE request — no date/alterid
-    filter. A plain TYPE="Voucher" collection ignores SVFROMDATE/SVTODATE
-    and any $Date FILTER we tried, so date-based chunking on the Tally
-    side doesn't work. Instead we fetch everything once (this can take
-    a few minutes for large companies — hence the long timeout) and then
-    split the result into batches CLIENT-SIDE before sending to the
-    server (see split_vouchers_xml)."""
+    """Fetch ALL vouchers for a company across ALL financial years.
+
+    IMPORTANT: SVCURRENTCOMPANY MUST be set here. Without it, Tally returns
+    vouchers for whichever company is currently active — not necessarily the
+    one we want. When two companies are open simultaneously, the wrong one's
+    data comes back.
+
+    We use the full VOUCHER_FETCH_FIELDS but in a single unfiltered request.
+    For large companies (7+ years) this may take several minutes.
+    """
+    # SVCURRENTCOMPANY scopes the request to the correct company
     comp_var = f'<SVCURRENTCOMPANY>{escape(company)}</SVCURRENTCOMPANY>' if company else ''
     xml = (
         '<ENVELOPE><HEADER><VERSION>1</VERSION>'
@@ -1039,9 +1043,18 @@ class TallySyncApp:
                 for n in closed:
                     self.log_append(f'Tally: "{n}" closed — will be skipped in next sync.', 'warn')
                 if opened or closed:
-                    self.root.after(0, self._rebuild_company_rows)
+                    self.root.after(0, self._render_companies)
         except Exception:
             pass  # Silent — don't disturb the user before sync
+
+    def _start_auto_refresh(self):
+        """Start periodic auto-refresh of company open/close status (every 60s).
+        Skipped during active sync. Updates UI when companies open/close in Tally."""
+        def _tick_refresh():
+            if not self.syncing:
+                threading.Thread(target=self._refresh_tally_companies, daemon=True).start()
+            self.root.after(60000, _tick_refresh)
+        self.root.after(60000, _tick_refresh)  # first run after 60s
 
     def _toggle_pause(self):
         self.paused = not self.paused
@@ -1251,6 +1264,9 @@ class TallySyncApp:
                     self.log_append(
                         f'Portal: {len(self.assigned)}/{plan.get("max_companies","?")} companies active'
                         + (f', {extra} more available: {extra_names}' if extra else ''), 'info')
+                    # Store unregistered companies so UI hint can show them
+                    self._unregistered_names = extra_names if extra else []
+                    self._unregistered_count  = extra if extra else 0
                     self._sync_watermarks_from_server()
                     # Migrate old name-based config keys → new id-based keys
                     self._migrate_config_keys()
@@ -1263,6 +1279,10 @@ class TallySyncApp:
             active_count = len([a for a in self.assigned]) if self.assigned else len(cos)
             self._set_status(f'TallyPrime Connected  ({active_count} active company found)', '#4ade80')
             self.log_append(f'Connected — {len(cos)} company', 'ok')
+            # Start periodic 60s refresh if not already started
+            if not getattr(self, '_auto_refresh_started', False):
+                self._auto_refresh_started = True
+                self._start_auto_refresh()
         except Exception as e:
             self._set_status(f'Not connected: {str(e)[:55]}', '#f87171')
             self.log_append(f'Connect failed: {e}', 'error')
@@ -1641,13 +1661,20 @@ class TallySyncApp:
                    f'add them on the portal (My Companies) if your plan allows.')
             tk.Label(note, text='⚠ ' + msg, bg='#fff7ed', fg='#b45309',
                      font=('Segoe UI', 9), wraplength=520,
-                     justify='left').pack(anchor='w', padx=8, pady=6)
-            if self.setup_url:
-                link = tk.Label(note, text=self.setup_url, bg='#fff7ed', fg='#1464f4',
+                     justify='left').pack(anchor='w', padx=8, pady=(6,2))
+            def _get_portal_url(self=self):
+                url = getattr(self, 'setup_url', '') or ''
+                if not url and self.cfg.has_option('agent','server_url'):
+                    url = self.cfg.get('agent','server_url').replace('/api/ingest.php','')
+                return (url.rstrip('/') + '/my-companies.php') if url else ''
+            portal_url = _get_portal_url()
+            if portal_url:
+                link = tk.Label(note, text='→ Open My Companies on portal',
+                                bg='#fff7ed', fg='#1464f4',
                                 font=('Segoe UI', 9, 'underline'), cursor='hand2')
                 link.pack(anchor='w', padx=8, pady=(0, 6))
                 link.bind('<Button-1>',
-                          lambda e: __import__('webbrowser').open(self.setup_url))
+                          lambda e, u=portal_url: __import__('webbrowser').open(u))
 
         if not self.assigned and not self.pending_setup and not self.companies:
             tk.Label(self.co_frame,
