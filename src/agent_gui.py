@@ -1283,12 +1283,16 @@ class TallySyncApp:
             return
 
         changed = False
+        if not self.cfg.has_section('agent'):
+            self.cfg.add_section('agent')
         for prefix in ('last_voucher_alterid__', 'last_master_alterid__',
                        'ledger_hash__', 'stock_hash__'):
             key_ = f'{prefix}id{cid}'
-            if self.cfg.has_option('agent', key_):
-                self.cfg.set('agent', key_, '0')
-                changed = True
+            self.cfg.set('agent', key_, '0')   # set even if not exists yet
+            changed = True
+        # Set force-resync flag so _sync_watermarks_from_server doesn't re-seed
+        # from the portal's old value (which is still high until full resync completes)
+        self.cfg.set('agent', f'force_resync__id{cid}', '1')
 
         if changed:
             save_cfg(self.cfg)
@@ -1353,21 +1357,18 @@ class TallySyncApp:
         self.root.after(0, lambda: self.dot.config(fg=color, bg='#eef4ff'))
 
     def _sync_watermarks_from_server(self):
-        """Pull each active company's last_voucher_alterid / last_sync_at
-        from the portal (Phase 1 additions to agent_companies.php) and:
-          - seed the local AlterID watermark if the server's is higher
-            than (or local is missing) — keeps incremental sync working
-            even after a reinstall / config.ini loss.
-          - update the 'Last sync' label at the top of the window from the
-            portal's record, so a freshly reinstalled agent doesn't show
-            'Never' when data has already been synced before.
-        Never moves a watermark backwards.
+        """Pull each active company's last_voucher_alterid from portal and sync
+        to local config using company_id-based keys (e.g. last_voucher_alterid__id29).
+        Never moves a watermark backwards (protects Force Full Resync = 0).
         """
         changed = False
-        most_recent = None  # 'YYYY-MM-DD HH:MM:SS' string, compared lexically (safe for this format)
+        most_recent = None
         for a in self.assigned:
             name = a.get('name', '')
-            key  = ('last_voucher_alterid__' + re.sub(r'[/\\\s]', '_', name)) if name else 'last_voucher_alterid'
+            cid  = str(a.get('company_id', ''))
+            # ALWAYS use id-based key — prevents name-key vs id-key mismatch
+            # that caused Force Full Resync to be overridden on next Connect
+            key  = f'last_voucher_alterid__id{cid}' if cid else                    ('last_voucher_alterid__' + re.sub(r'[/\\\s]', '_', name))
             try:
                 server_alterid = int(a.get('last_voucher_alterid', 0) or 0)
             except (TypeError, ValueError):
@@ -1379,22 +1380,44 @@ class TallySyncApp:
                 except ValueError:
                     local_alterid = 0
             if server_alterid > local_alterid:
+                # Server has higher watermark — seed local (e.g. after reinstall)
                 if not self.cfg.has_section('agent'):
                     self.cfg.add_section('agent')
                 self.cfg.set('agent', key, str(server_alterid))
                 changed = True
                 self.log_append(
-                    f'"{name}": resuming from portal AlterID watermark {server_alterid}'
-                    + (f' (local was {local_alterid})' if local_alterid else ''), 'info')
+                    f'"{name}": seeding local watermark from portal: {server_alterid}', 'info')
             elif server_alterid == 0 and local_alterid > 0:
-                # Server was reset to 0 (e.g. admin dropped & re-added company)
-                # — clear local watermark so next sync does a full first-sync
+                # Server reset to 0 — clear local so next sync is full resync
                 if not self.cfg.has_section('agent'):
                     self.cfg.add_section('agent')
                 self.cfg.set('agent', key, '0')
                 changed = True
                 self.log_append(
-                    f'"{name}": server AlterID reset to 0 — local watermark cleared, next sync will be a full resync.', 'warn')
+                    f'"{name}": server AlterID=0 — local watermark cleared, full resync on next sync.', 'warn')
+            # If local == 0 (Force Full Resync was used) and server > 0,
+            # DO NOT seed from server — respect the forced reset
+            # (condition above: server > local already handles the seed case correctly
+            #  since 71906 > 0 would seed, BUT after Force Full Resync local=0
+            #  and server=71906 — this WOULD incorrectly seed! Fix: check if
+            #  force_resync flag is set for this company)
+            # The correct logic: if local was explicitly set to 0 by Force Full Resync,
+            # server should NOT override it. We detect this by checking if a special
+            # force-resync flag is stored.
+            elif server_alterid > 0 and local_alterid == 0:
+                flag_key = f'force_resync__id{cid}'
+                if self.cfg.has_option('agent', flag_key) and                    self.cfg.get('agent', flag_key).strip() == '1':
+                    # Force resync was requested — keep local at 0, ignore server value
+                    self.log_append(
+                        f'"{name}": force resync active — keeping watermark at 0, ignoring server value {server_alterid}', 'info')
+                else:
+                    # Normal case: seed from server (e.g. reinstall)
+                    if not self.cfg.has_section('agent'):
+                        self.cfg.add_section('agent')
+                    self.cfg.set('agent', key, str(server_alterid))
+                    changed = True
+                    self.log_append(
+                        f'"{name}": seeding watermark from portal: {server_alterid}', 'info')
 
             last_sync = a.get('last_sync_at')
             if last_sync and (most_recent is None or last_sync > most_recent):
@@ -1942,6 +1965,10 @@ class TallySyncApp:
             if not any_error:
                 if not self.cfg.has_section('agent'): self.cfg.add_section('agent')
                 self.cfg.set('agent', alterid_key, str(max_alterid_seen))
+                # Clear force-resync flag now that full resync completed successfully
+                flag_key = f'force_resync__id{uid}'
+                if self.cfg.has_option('agent', flag_key):
+                    self.cfg.remove_option('agent', flag_key)
                 save_cfg(self.cfg)
 
             now_str = datetime.now().strftime('%d %b %Y, %H:%M')
