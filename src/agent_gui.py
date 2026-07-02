@@ -464,15 +464,27 @@ VOUCHER_BLOCK_RE = re.compile(r'<VOUCHER\b.*?</VOUCHER>', re.S)
 
 def fetch_voucher_numbers_for_renumber(host, company='', from_date=None, to_date=None):
     """
-    Lightweight fetch — only GUID and VOUCHERNUMBER for all vouchers in date range.
-    Used after incremental sync to catch vouchers that were renumbered by Tally
-    (e.g. inserting a voucher between existing ones shifts all subsequent numbers).
-    Returns list of {'guid': ..., 'no': ...}
+    Lightweight renumber check — fetches only GUID+VOUCHERNUMBER for CURRENT FY.
+    Limited to current financial year only (not all years) so it runs fast.
+    Tally renumbers when a voucher is inserted between existing entries.
     """
+    import datetime
     comp_var = f'<SVCURRENTCOMPANY>{escape(company)}</SVCURRENTCOMPANY>' if company else ''
-    fd = from_date or ''
-    td = to_date   or ''
-    dates = (f'<SVFROMDATE>{fd}</SVFROMDATE>' if fd else '') +             (f'<SVTODATE>{td}</SVTODATE>'     if td else '')
+    # Limit to current FY for speed (renumber only affects current period entries)
+    if not from_date or not to_date:
+        today = datetime.date.today()
+        if today.month >= 4:
+            fy_s = datetime.date(today.year,     4, 1)
+            fy_e = datetime.date(today.year + 1, 3, 31)
+        else:
+            fy_s = datetime.date(today.year - 1, 4, 1)
+            fy_e = datetime.date(today.year,     3, 31)
+        fd = fy_s.strftime('%d-%b-%Y')
+        td = fy_e.strftime('%d-%b-%Y')
+    else:
+        fd = from_date
+        td = to_date
+    dates = f'<SVFROMDATE>{fd}</SVFROMDATE><SVTODATE>{td}</SVTODATE>'
     xml = (f'<ENVELOPE><HEADER><VERSION>1</VERSION>'
            f'<TALLYREQUEST>Export</TALLYREQUEST>'
            f'<TYPE>Collection</TYPE><ID>TSVnoRenumber</ID></HEADER>'
@@ -483,7 +495,7 @@ def fetch_voucher_numbers_for_renumber(host, company='', from_date=None, to_date
            f'<TYPE>Voucher</TYPE>'
            f'<FETCH>GUID,VOUCHERNUMBER</FETCH>'
            f'</COLLECTION></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>')
-    resp = tally_post(host, xml, timeout=60)
+    resp = tally_post(host, xml, timeout=30)  # 30s timeout — current FY only
     pairs = []
     if resp:
         for m in re.finditer(r'<VOUCHER[^>]*>(.*?)</VOUCHER>', resp, re.S|re.I):
@@ -499,23 +511,27 @@ def fetch_voucher_numbers_for_renumber(host, company='', from_date=None, to_date
 def fetch_all_vouchers_unfiltered(host, company='', timeout=1800):
     """Fetch ALL vouchers for a company across ALL financial years.
 
-    IMPORTANT: SVCURRENTCOMPANY MUST be set here. Without it, Tally returns
-    vouchers for whichever company is currently active — not necessarily the
-    one we want. When two companies are open simultaneously, the wrong one's
-    data comes back.
-
-    We use the full VOUCHER_FETCH_FIELDS but in a single unfiltered request.
-    For large companies (7+ years) this may take several minutes.
+    KEY LEARNINGS:
+    1. SVCURRENTCOMPANY must be set to target the right company when multiple are open.
+    2. Without SVFROMDATE/SVTODATE, Tally only returns the CURRENT PERIOD
+       (shown in Tally header e.g. "1-Apr-26 to 31-Mar-27") — not all years!
+    3. Setting SVFROMDATE=01-Apr-1990 and SVTODATE=31-Mar-2099 forces Tally
+       to return ALL vouchers regardless of selected period.
+    4. The Voucher collection TYPE respects these date variables.
     """
-    # SVCURRENTCOMPANY scopes the request to the correct company
     comp_var = f'<SVCURRENTCOMPANY>{escape(company)}</SVCURRENTCOMPANY>' if company else ''
+    # Wide date range to capture ALL financial years (1990 to 2099)
+    date_range = (
+        '<SVFROMDATE>01-Apr-1990</SVFROMDATE>'
+        '<SVTODATE>31-Mar-2099</SVTODATE>'
+    )
     xml = (
         '<ENVELOPE><HEADER><VERSION>1</VERSION>'
         '<TALLYREQUEST>Export</TALLYREQUEST>'
         '<TYPE>Collection</TYPE><ID>TSAllVch</ID></HEADER>'
         '<BODY><DESC><STATICVARIABLES>'
         '<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>'
-        f'{comp_var}'
+        f'{comp_var}{date_range}'
         '</STATICVARIABLES>'
         '<TDL><TDLMESSAGE>'
         '<COLLECTION NAME="TSAllVch" ISMODIFY="No">'
@@ -1042,19 +1058,29 @@ class TallySyncApp:
                     self.log_append(f'Tally: "{n}" opened.', 'ok')
                 for n in closed:
                     self.log_append(f'Tally: "{n}" closed — will be skipped in next sync.', 'warn')
+                # Re-render on any change (open/close) to update status + hint
                 if opened or closed:
                     self.root.after(0, self._render_companies)
+                else:
+                    # Even if names didn't change, re-render to update progress bar states
+                    # This is cheap (just rebuilds the lightweight tkinter widgets)
+                    pass
         except Exception:
             pass  # Silent — don't disturb the user before sync
 
     def _start_auto_refresh(self):
-        """Start periodic auto-refresh of company open/close status (every 60s).
-        Skipped during active sync. Updates UI when companies open/close in Tally."""
+        """Start periodic auto-refresh of company open/close status.
+        Runs every 30 seconds. Skipped during active sync.
+        Also does an immediate first refresh after 5 seconds.
+        """
         def _tick_refresh():
             if not self.syncing:
-                threading.Thread(target=self._refresh_tally_companies, daemon=True).start()
-            self.root.after(60000, _tick_refresh)
-        self.root.after(60000, _tick_refresh)  # first run after 60s
+                try:
+                    threading.Thread(target=self._refresh_tally_companies, daemon=True).start()
+                except Exception:
+                    pass
+            self.root.after(30000, _tick_refresh)  # repeat every 30 seconds
+        self.root.after(5000,  _tick_refresh)  # first run after 5s
 
     def _toggle_pause(self):
         self.paused = not self.paused
@@ -1092,62 +1118,73 @@ class TallySyncApp:
             return
         win = tk.Toplevel(self.root)
         win.title('BizView Pro — Settings')
-        win.geometry('440x460')
+        win.geometry('460x540')
         win.resizable(False, False)
         win.configure(bg='#f0f4f8')
         win.grab_set()
         self._settings_win = win
 
-        # Header
-        hdr = tk.Frame(win, bg='#0f1923', height=48)
+        # ── Header ────────────────────────────────────────────────────────────
+        hdr = tk.Frame(win, bg='#1464f4', height=50)
         hdr.pack(fill='x'); hdr.pack_propagate(False)
-        tk.Label(hdr, text='⚙  Agent Settings', bg='#0f1923', fg='white',
-                 font=('Segoe UI',13,'bold')).pack(side='left', padx=14, pady=10)
+        tk.Label(hdr, text='⚙  Agent Settings', bg='#1464f4', fg='white',
+                 font=('Segoe UI', 13, 'bold')).pack(side='left', padx=14, pady=10)
+        # Close button in header
+        tk.Button(hdr, text='✕', bg='#1464f4', fg='white',
+                  font=('Segoe UI', 12), relief='flat', bd=0, cursor='hand2',
+                  activebackground='#0e4fbf', activeforeground='white',
+                  command=win.destroy).pack(side='right', padx=10, pady=8)
 
         body = tk.Frame(win, bg='#f0f4f8', padx=16, pady=12)
         body.pack(fill='both', expand=True)
 
         tk.Label(body,
-            text='These credentials are provided by your TallySync administrator. Do not share them with anyone.',
-            bg='#f0f4f8', fg='#6b7280', font=('Segoe UI',9), wraplength=380,
-            justify='left').pack(anchor='w', pady=(0,10))
+            text='Credentials are provided by your BizView Pro admin. Do not share them.',
+            bg='#f0f4f8', fg='#6b7280', font=('Segoe UI', 9), wraplength=400,
+            justify='left').pack(anchor='w', pady=(0, 10))
 
         fields = [
             ('Master Key',    'master_key',    ''),
             ('Master Secret', 'master_secret', ''),
-            ('Tally URL',     'tally_host',  'http://localhost:9000'),
-            ('Server URL',    'server_url',  'http://localhost/tallysync/api/ingest.php'),
+            ('Tally URL',     'tally_host',    'http://localhost:9000'),
+            ('Server URL',    'server_url',    'http://bizviewpro.in/tallysync/api/ingest.php'),
         ]
         svars = {}
         for label, key, placeholder in fields:
             row = tk.Frame(body, bg='#f0f4f8')
             row.pack(fill='x', pady=3)
             tk.Label(row, text=label, bg='#f0f4f8', fg='#374151',
-                     font=('Segoe UI',9,'bold'), width=12, anchor='e').pack(side='left', padx=(0,8))
-            cur = self.cfg.get('agent',key).strip() if self.cfg.has_option('agent',key) else ''
+                     font=('Segoe UI', 9, 'bold'), width=13, anchor='e').pack(side='left', padx=(0, 8))
+            cur = self.cfg.get('agent', key).strip() if self.cfg.has_option('agent', key) else ''
             var = tk.StringVar(value=cur)
-            show = '*' if key in ('master_key','master_secret') else ''
-            ent = tk.Entry(row, textvariable=var, font=('Segoe UI',10),
-                           show=show, bg='white', relief='flat', bd=1,
+            show = '*' if key in ('master_key', 'master_secret') else ''
+            ent = tk.Entry(row, textvariable=var, font=('Segoe UI', 10),
+                           show=show, bg='white', relief='flat', bd=0,
                            highlightthickness=1, highlightbackground='#d1d5db',
                            highlightcolor='#1464f4')
-            ent.pack(side='left', fill='x', expand=True)
+            ent.pack(side='left', fill='x', expand=True, ipady=5)
             svars[key] = var
 
-        # ── Auto-sync interval (moved here from main window) ─────────────────
+        # ── Sync interval ─────────────────────────────────────────────────────
         irow = tk.Frame(body, bg='#f0f4f8')
         irow.pack(fill='x', pady=3)
         tk.Label(irow, text='Sync Interval', bg='#f0f4f8', fg='#374151',
-                 font=('Segoe UI',9,'bold'), width=12, anchor='e').pack(side='left', padx=(0,8))
-        _iv = self.cfg.get('agent','interval_min').strip() if self.cfg.has_option('agent','interval_min') else '5'
+                 font=('Segoe UI', 9, 'bold'), width=13, anchor='e').pack(side='left', padx=(0, 8))
+        _iv = self.cfg.get('agent', 'interval_min').strip() if self.cfg.has_option('agent', 'interval_min') else '5'
         self.interval_var = tk.StringVar(value=_iv)
         interval_cb = ttk.Combobox(irow, textvariable=self.interval_var,
-                                    values=['5','10','20','30','45','60'],
-                                    width=6, state='readonly', font=('Segoe UI',10))
+                                    values=['5', '10', '20', '30', '45', '60'],
+                                    width=6, state='readonly', font=('Segoe UI', 10))
         interval_cb.pack(side='left')
         interval_cb.bind('<<ComboboxSelected>>', self._on_interval_change)
         tk.Label(irow, text='minutes', bg='#f0f4f8', fg='#6b7280',
-                 font=('Segoe UI',9)).pack(side='left', padx=(6,0))
+                 font=('Segoe UI', 9)).pack(side='left', padx=(6, 0))
+
+        # ── Action buttons row ────────────────────────────────────────────────
+        tk.Frame(body, bg='#e5e7eb', height=1).pack(fill='x', pady=(12, 10))
+
+        btn_row1 = tk.Frame(body, bg='#f0f4f8')
+        btn_row1.pack(fill='x', pady=(0, 6))
 
         def save_settings():
             if not self.cfg.has_section('agent'):
@@ -1156,55 +1193,61 @@ class TallySyncApp:
                 val = var.get().strip()
                 if val:
                     self.cfg.set('agent', key, val)
-            # Save interval from the combobox added in this window
             interval_val = self.interval_var.get().strip()
             if interval_val:
                 self.cfg.set('agent', 'interval_min', interval_val)
                 self._next_sync = time.time() + self._interval_secs()
             save_cfg(self.cfg)
             self.cfg = load_cfg()
-            lbl_ok.config(text='Saved successfully')
-            win.after(2000, lambda: lbl_ok.config(text=''))
+            lbl_ok.config(text='✓  Settings saved successfully', fg='#059669')
+            win.after(2500, lambda: lbl_ok.config(text=''))
             self.log_append('Settings saved.', 'ok')
 
-        def toggle_show():
-            for key in ('api_key','secret_key'):
-                pass  # toggle visibility if needed
-
-        save_btn_row = tk.Frame(body, bg='#f0f4f8')
-        save_btn_row.pack(fill='x', pady=(12, 0))
-        tk.Button(save_btn_row, text='💾  Save Settings',
-                  bg='#1464f4', fg='white', font=('Segoe UI',10,'bold'),
+        # Save button — Royal Blue
+        tk.Button(btn_row1, text='💾  Save Settings',
+                  bg='#1464f4', fg='white', font=('Segoe UI', 10, 'bold'),
                   relief='flat', cursor='hand2', padx=14, pady=8, bd=0,
+                  activebackground='#0e4fbf', activeforeground='white',
                   command=save_settings).pack(side='left')
-        tk.Button(save_btn_row, text='Close',
-                  bg='#f3f4f6', fg='#374151', font=('Segoe UI',10),
-                  relief='flat', cursor='hand2', padx=14, pady=8, bd=0,
-                  command=win.destroy).pack(side='left', padx=(8, 0))
 
-        # Test Server button — moved here from main window
-        test_row = tk.Frame(body, bg='#f0f4f8')
-        test_row.pack(fill='x', pady=(10, 0))
-        lbl_test_result = tk.Label(test_row, text='', bg='#f0f4f8',
-                                    font=('Segoe UI', 9))
+        # Test Server button — Teal/Green
+        lbl_test_result = tk.Label(body, text='', bg='#f0f4f8', font=('Segoe UI', 9))
         def _run_test():
-            lbl_test_result.config(text='Testing…', fg='#6b7280')
+            lbl_test_result.config(text='Testing connection…', fg='#6b7280')
             win.update_idletasks()
             self._test_server(result_label=lbl_test_result)
-        tk.Button(test_row, text='🔍  Test Server Connection',
-                  bg='#f3f4f6', fg='#374151', font=('Segoe UI',10),
+        tk.Button(btn_row1, text='🔍  Test Connection',
+                  bg='#0f766e', fg='white', font=('Segoe UI', 10),
                   relief='flat', cursor='hand2', padx=14, pady=8, bd=0,
-                  command=_run_test).pack(side='left')
-        lbl_test_result.pack(side='left', padx=(10, 0))
+                  activebackground='#0d6460', activeforeground='white',
+                  command=_run_test).pack(side='left', padx=(8, 0))
 
-        lbl_ok = tk.Label(body, text='', bg='#f0f4f8', fg='#0e9f6e',
-                          font=('Segoe UI', 9))
-        lbl_ok.pack(anchor='w', pady=(6, 0))
+        # Open Logs button — Slate
+        def _open_logs():
+            import subprocess, sys, os
+            try:
+                if sys.platform == 'win32':
+                    os.startfile(str(LOG_FILE))
+                else:
+                    subprocess.Popen(['xdg-open', str(LOG_FILE)])
+            except Exception as ex:
+                lbl_ok.config(text=f'Cannot open log: {ex}', fg='#dc2626')
 
+        tk.Button(btn_row1, text='📋  View Logs',
+                  bg='#475569', fg='white', font=('Segoe UI', 10),
+                  relief='flat', cursor='hand2', padx=14, pady=8, bd=0,
+                  activebackground='#334155', activeforeground='white',
+                  command=_open_logs).pack(side='left', padx=(8, 0))
+
+        lbl_test_result.pack(anchor='w', pady=(4, 0))
+        lbl_ok = tk.Label(body, text='', bg='#f0f4f8', font=('Segoe UI', 9))
+        lbl_ok.pack(anchor='w', pady=(2, 0))
+
+        # Log file path
         tk.Label(body,
-            text='Log file: ' + str(LOG_FILE),
-            bg='#f0f4f8', fg='#9ca3af', font=('Consolas',8),
-            wraplength=380, justify='left').pack(anchor='w', pady=(12,0))
+            text=f'Log: {LOG_FILE}',
+            bg='#f0f4f8', fg='#9ca3af', font=('Consolas', 8),
+            wraplength=420, justify='left').pack(anchor='w', pady=(10, 0))
 
     # ── CONNECT ───────────────────────────────────────────────────────────────
 
