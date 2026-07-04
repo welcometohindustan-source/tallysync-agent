@@ -726,6 +726,45 @@ def agent_companies_url(server_url):
     base = server_url.rsplit('/', 1)[0]
     return base + '/agent_companies.php'
 
+def fetch_voucher_guids_for_presence_check(host, company='', from_date=None, to_date=None):
+    """
+    Lightweight GUID-only fetch across the whole synced range, used to detect
+    vouchers that were hard-deleted in Tally. Tally does NOT emit an
+    ISDELETED=Yes tombstone for a genuinely deleted voucher in a normal
+    Collection export — the voucher simply stops appearing at all. So the
+    only reliable way to know "voucher X no longer exists in Tally" is to
+    compare a fresh full list of GUIDs against what the portal has marked
+    active, and flag anything missing as deleted.
+    """
+    comp_var = f'<SVCURRENTCOMPANY>{escape(company)}</SVCURRENTCOMPANY>' if company else ''
+    dates = ''
+    if from_date: dates += f'<SVFROMDATE>{from_date}</SVFROMDATE>'
+    if to_date:   dates += f'<SVTODATE>{to_date}</SVTODATE>'
+    xml = (f'<ENVELOPE><HEADER><VERSION>1</VERSION>'
+           f'<TALLYREQUEST>Export</TALLYREQUEST>'
+           f'<TYPE>Collection</TYPE><ID>TSVGuids</ID></HEADER>'
+           f'<BODY><DESC><STATICVARIABLES>'
+           f'<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>{dates}{comp_var}'
+           f'</STATICVARIABLES><TDL><TDLMESSAGE>'
+           f'<COLLECTION NAME="TSVGuids" ISMODIFY="No">'
+           f'<TYPE>Voucher</TYPE>'
+           f'<FETCH>GUID</FETCH>'
+           f'</COLLECTION></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>')
+    resp = tally_post(host, xml, timeout=120)
+    guids = []
+    if resp:
+        for m in re.finditer(r'<GUID[^>]*>(.*?)</GUID>', resp, re.I | re.S):
+            g = re.sub(r'\s+', '', m.group(1))
+            if g: guids.append(g)
+    return guids
+
+def voucher_presence_url(server_url):
+    """Derive api/voucher_presence.php from the configured ingest URL."""
+    if server_url.endswith('ingest.php'):
+        return server_url[:-len('ingest.php')] + 'voucher_presence.php'
+    base = server_url.rsplit('/', 1)[0]
+    return base + '/voucher_presence.php'
+
 def renumber_vouchers_url(server_url):
     """Derive api/renumber_vouchers.php from the configured ingest URL."""
     if server_url.endswith('ingest.php'):
@@ -2164,6 +2203,42 @@ class TallySyncApp:
                         self.log_append(f'Renumber: all {chk} numbers match ✓', 'info')
             except Exception as rne:
                 self.log_append(f'Renumber check skipped: {rne}', 'warn')
+
+            # ── Daily deleted-voucher check ──────────────────────────────────────
+            # See fetch_voucher_guids_for_presence_check()'s docstring: Tally gives
+            # us no direct signal for a hard-deleted voucher, so once a day we pull
+            # every GUID currently in Tally for the synced range and let the portal
+            # flag anything it has as active but that's now missing.
+            try:
+                presence_key = f'last_presence_check_date__id{uid}' if uid else 'last_presence_check_date'
+                last_presence_date = self.cfg.get('agent', presence_key, fallback='') \
+                    if self.cfg.has_option('agent', presence_key) else ''
+                today_pc = datetime.now().strftime('%Y%m%d')
+                if last_presence_date != today_pc:
+                    _prog(98, 'Checking for deleted vouchers…')
+                    self.log_append('Checking for vouchers deleted in Tally…', 'info')
+                    fy_start = self.cfg.get('agent', 'fy_start') if self.cfg.has_option('agent','fy_start') else None
+                    fy_end   = self.cfg.get('agent', 'fy_end')   if self.cfg.has_option('agent','fy_end')   else None
+                    guids = fetch_voucher_guids_for_presence_check(
+                        host, company=company_name, from_date=fy_start, to_date=fy_end)
+                    if guids:
+                        pres_url = voucher_presence_url(srv)
+                        pres_res = simple_post(pres_url, {
+                            'uid': uid, 'key': key,
+                            'guids_json': json.dumps(guids),
+                        }, timeout=60)
+                        marked = pres_res.get('marked_deleted', 0) if isinstance(pres_res, dict) else 0
+                        if marked > 0:
+                            self.log_append(f'Deleted-voucher check: {marked} voucher(s) marked deleted.', 'ok')
+                        else:
+                            self.log_append('Deleted-voucher check: no changes.', 'info')
+                        if not self.cfg.has_section('agent'): self.cfg.add_section('agent')
+                        self.cfg.set('agent', presence_key, today_pc)
+                        save_cfg(self.cfg)
+                    else:
+                        self.log_append('Deleted-voucher check skipped — Tally returned no GUIDs.', 'warn')
+            except Exception as pce:
+                self.log_append(f'Deleted-voucher check skipped: {pce}', 'warn')
 
             # ── Daily Tally data folder backup ──────────────────────────────────
             # Zips the on-disk Tally company folder (identified by Tally Number,
