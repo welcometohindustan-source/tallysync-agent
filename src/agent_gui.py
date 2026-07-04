@@ -325,7 +325,7 @@ def fetch_ledgers(host, company=''):
          'LEDMAILINGDETAILS.LIST.PHONENUMBER',
          'LEDMAILINGDETAILS.LIST.MOBILEPHONE',
          'LEDMAILINGDETAILS.LIST.LANDLINEPHONE',
-         'CONTACTNO','PHONENUMBER','MOBILEPHONE'],
+         'CONTACTNO','PHONENUMBER','MOBILEPHONE','LEDGERPHONE','LEDGERMOBILE'],
         company=company), timeout=60)
 
 def fetch_stock(host, company=''):
@@ -391,7 +391,7 @@ def fetch_ledgers_by_alterid(host, min_alterid, company=''):
         'LEDMAILINGDETAILS.LIST.PHONENUMBER',
         'LEDMAILINGDETAILS.LIST.MOBILEPHONE',
         'LEDMAILINGDETAILS.LIST.LANDLINEPHONE',
-        'CONTACTNO','PHONENUMBER','MOBILEPHONE','ISDELETEDMASTER',
+        'CONTACTNO','PHONENUMBER','MOBILEPHONE','LEDGERPHONE','LEDGERMOBILE','ISDELETEDMASTER',
     ])
     xml = (
         '<ENVELOPE><HEADER><VERSION>1</VERSION>'
@@ -732,6 +732,77 @@ def renumber_vouchers_url(server_url):
         return server_url[:-len('ingest.php')] + 'renumber_vouchers.php'
     base = server_url.rsplit('/', 1)[0]
     return base + '/renumber_vouchers.php'
+
+def agent_backup_url(server_url):
+    """Derive api/agent_backup.php from the configured ingest URL."""
+    if server_url.endswith('ingest.php'):
+        return server_url[:-len('ingest.php')] + 'agent_backup.php'
+    base = server_url.rsplit('/', 1)[0]
+    return base + '/agent_backup.php'
+
+def zip_company_folder(folder_path, tally_number):
+    """Zip a Tally company's data folder to a temp file. Returns the zip path, or None."""
+    import tempfile, zipfile, os
+    safe_num = re.sub(r'[^A-Za-z0-9]', '', str(tally_number)) or 'company'
+    zip_path = os.path.join(tempfile.gettempdir(),
+                             f'tsbackup_{safe_num}_{datetime.now().strftime("%Y%m%d")}.zip')
+    try:
+        if os.path.exists(zip_path):
+            os.remove(zip_path)
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for root, _dirs, files in os.walk(folder_path):
+                for f in files:
+                    fp = os.path.join(root, f)
+                    arcname = os.path.relpath(fp, folder_path)
+                    try:
+                        zf.write(fp, arcname)
+                    except Exception:
+                        pass  # Tally may hold some files open/locked — skip, don't fail the whole backup
+        return zip_path if os.path.getsize(zip_path) > 0 else None
+    except Exception as e:
+        log.error(f'Zip backup failed: {e}')
+        return None
+
+def upload_company_backup(server_url, user_id, api_key, secret, tally_number, zip_path, company_name=''):
+    """Upload a zipped Tally company data folder to the portal as a multipart file."""
+    import os
+    url = agent_backup_url(server_url)
+    try:
+        with open(zip_path, 'rb') as f:
+            file_bytes = f.read()
+    except Exception as e:
+        return {'ok': False, 'error': f'Could not read zip: {e}'}
+
+    boundary = 'TSBackupBnd' + hashlib.md5(file_bytes[:16]).hexdigest()[:8]
+    fname    = os.path.basename(zip_path)
+    parts = [
+        f'--{boundary}\r\nContent-Disposition: form-data; name="uid"\r\n\r\n{user_id}',
+        f'--{boundary}\r\nContent-Disposition: form-data; name="key"\r\n\r\n{api_key}',
+        f'--{boundary}\r\nContent-Disposition: form-data; name="secret"\r\n\r\n{secret}',
+        f'--{boundary}\r\nContent-Disposition: form-data; name="tally_number"\r\n\r\n{tally_number}',
+        f'--{boundary}\r\nContent-Disposition: form-data; name="company_name"\r\n\r\n{company_name}',
+    ]
+    body = ('\r\n'.join(parts) + '\r\n').encode('utf-8')
+    body += (f'--{boundary}\r\nContent-Disposition: form-data; name="backup_file"; filename="{fname}"\r\n'
+             f'Content-Type: application/zip\r\n\r\n').encode('utf-8')
+    body += file_bytes
+    body += f'\r\n--{boundary}--'.encode('utf-8')
+
+    req = urllib.request.Request(url, data=body,
+        headers={'Content-Type': f'multipart/form-data; boundary={boundary}',
+                 'Content-Length': str(len(body)),
+                 'X-TallySync-Agent': '4.0'},
+        method='POST')
+    try:
+        with urllib.request.urlopen(req, timeout=180) as r:
+            resp = r.read().decode('utf-8', errors='replace')
+            try:    return json.loads(resp)
+            except: return {'ok': False, 'error': f'Bad JSON: {resp[:300]}'}
+    except urllib.error.HTTPError as e:
+        body2 = e.read().decode('utf-8', errors='replace')[:400]
+        return {'ok': False, 'error': f'HTTP {e.code}: {body2}'}
+    except Exception as ex:
+        return {'ok': False, 'error': str(ex)}
 
 def discover_companies_on_server(server_url, master_key, master_secret, companies):
     """Tell the portal which Tally companies the agent can see."""
@@ -1853,12 +1924,23 @@ class TallySyncApp:
                 try: last_master_alterid = int(self.cfg.get('agent', master_key).strip() or '0')
                 except ValueError: pass
 
-            is_first_master_sync = (last_master_alterid == 0)
+            # Safety net: force a full master resync once a day regardless of the
+            # AlterID watermark. The incremental $AlterId filter is reliable for
+            # Voucher collections but has been inconsistent for Ledger/StockItem
+            # (master) collections on some Tally releases — if it ever silently
+            # returns nothing, closing balances would otherwise go stale forever.
+            full_master_key = f'last_full_master_sync__id{uid}' if uid else 'last_full_master_sync'
+            last_full_master_date = self.cfg.get('agent', full_master_key, fallback='') \
+                if self.cfg.has_option('agent', full_master_key) else ''
+            today_str = datetime.now().strftime('%Y%m%d')
+            force_daily_full_master = (last_full_master_date != today_str)
+
+            is_first_master_sync = (last_master_alterid == 0) or force_daily_full_master
             max_master_alterid   = last_master_alterid
 
             # ── 1. Ledgers ────────────────────────────────────────────────────
             _prog( 5,
-                'Fetching all ledgers (first sync)…' if is_first_master_sync
+                'Fetching all ledgers (full sync)…' if is_first_master_sync
                 else f'Checking ledger changes since AlterID {last_master_alterid}…')
             if is_first_master_sync:
                 xml = fetch_ledgers(host, company=company or '')
@@ -1896,7 +1978,7 @@ class TallySyncApp:
 
             # ── 2. Stock Items ────────────────────────────────────────────────
             _prog( 22,
-                'Fetching all stock items (first sync)…' if is_first_master_sync
+                'Fetching all stock items (full sync)…' if is_first_master_sync
                 else f'Checking stock changes since AlterID {last_master_alterid}…')
             if is_first_master_sync:
                 xml = fetch_stock(host, company=company or '')
@@ -1939,6 +2021,11 @@ class TallySyncApp:
                 self.cfg.set('agent', master_key, str(max_master_alterid))
                 save_cfg(self.cfg)
                 self.log_append(f'Master AlterID watermark updated: {last_master_alterid} → {max_master_alterid}', 'dim')
+            if is_first_master_sync:
+                if not self.cfg.has_section('agent'):
+                    self.cfg.add_section('agent')
+                self.cfg.set('agent', full_master_key, today_str)
+                save_cfg(self.cfg)
 
             # ── 3. Vouchers ──────────────────────────────────────────────────
             alterid_key = (f'last_voucher_alterid__id{uid}') if company_name else 'last_voucher_alterid'
@@ -2077,6 +2164,45 @@ class TallySyncApp:
                         self.log_append(f'Renumber: all {chk} numbers match ✓', 'info')
             except Exception as rne:
                 self.log_append(f'Renumber check skipped: {rne}', 'warn')
+
+            # ── Daily Tally data folder backup ──────────────────────────────────
+            # Zips the on-disk Tally company folder (identified by Tally Number,
+            # not name, so same-named split-year companies never get mixed up)
+            # and uploads it to the portal once per day.
+            try:
+                backup_key = f'last_pc_backup_date__id{uid}' if uid else 'last_pc_backup_date'
+                last_backup_date = self.cfg.get('agent', backup_key, fallback='') \
+                    if self.cfg.has_option('agent', backup_key) else ''
+                today_bk = datetime.now().strftime('%Y%m%d')
+                if last_backup_date != today_bk:
+                    co_info = tally_by_num_s.get(portal_num_s) if portal_num_s else None
+                    folder  = (co_info or {}).get('path', '')
+                    if folder and os.path.isdir(folder):
+                        _prog(97, 'Backing up Tally data…')
+                        self.log_append(
+                            f'Backing up Tally data folder for "{company_name}" (#{portal_num_s})…', 'info')
+                        zpath = zip_company_folder(folder, portal_num_s)
+                        if zpath:
+                            bres = upload_company_backup(
+                                srv, uid, key, sec, portal_num_s, zpath, company_name=company_name)
+                            if bres.get('ok'):
+                                self.log_append(
+                                    f'Backup uploaded ✓ ({os.path.getsize(zpath):,} bytes)', 'ok')
+                                if not self.cfg.has_section('agent'): self.cfg.add_section('agent')
+                                self.cfg.set('agent', backup_key, today_bk)
+                                save_cfg(self.cfg)
+                            else:
+                                self.log_append(f'Backup upload failed: {bres.get("error")} '
+                                                 f'— will retry next sync.', 'warn')
+                            try: os.remove(zpath)
+                            except Exception: pass
+                        else:
+                            self.log_append('Backup skipped — could not zip the Tally data folder.', 'warn')
+                    else:
+                        self.log_append(
+                            f'Backup skipped — Tally data folder not found for #{portal_num_s}.', 'warn')
+            except Exception as bke:
+                self.log_append(f'Backup error: {bke}', 'warn')
 
             # ── Sync complete ─────────────────────────────────────────────────
             _prog(100, 'Sync complete ✓')
