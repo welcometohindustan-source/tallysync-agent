@@ -1596,13 +1596,52 @@ class TallySyncApp:
             if last_sync and (most_recent is None or last_sync > most_recent):
                 most_recent = last_sync
 
+            # ── Master (ledger + stock) watermark reconciliation ──────────────
+            # The agent keeps ONE combined local watermark for both ledgers and
+            # stock (last_master_alterid__id{cid}), while the server tracks them
+            # separately (last_ledger_alterid / last_stock_alterid — each master
+            # type has its own independent ALTERID sequence in Tally). We seed
+            # from whichever of the two is LOWER, never higher — using the
+            # higher one could make us skip real changes on the other type.
+            mkey = f'last_master_alterid__id{cid}' if cid else 'last_master_alterid'
+            try:
+                server_ledger = int(a.get('last_ledger_alterid', 0) or 0)
+            except (TypeError, ValueError):
+                server_ledger = 0
+            try:
+                server_stock = int(a.get('last_stock_alterid', 0) or 0)
+            except (TypeError, ValueError):
+                server_stock = 0
+            server_master = min(server_ledger, server_stock) if (server_ledger and server_stock) \
+                else max(server_ledger, server_stock)
+            local_master = 0
+            if self.cfg.has_option('agent', mkey):
+                try:
+                    local_master = int(self.cfg.get('agent', mkey).strip() or '0')
+                except ValueError:
+                    local_master = 0
+            if server_master > local_master:
+                if not self.cfg.has_section('agent'):
+                    self.cfg.add_section('agent')
+                self.cfg.set('agent', mkey, str(server_master))
+                changed = True
+                self.log_append(
+                    f'"{name}": seeding master watermark from portal: {server_master}', 'info')
+            elif server_master == 0 and local_master > 0:
+                if not self.cfg.has_section('agent'):
+                    self.cfg.add_section('agent')
+                self.cfg.set('agent', mkey, '0')
+                changed = True
+                self.log_append(
+                    f'"{name}": server master AlterID=0 — local watermark cleared, full resync on next sync.', 'warn')
+
         if changed:
             save_cfg(self.cfg)
 
         if most_recent:
             try:
                 dt = datetime.strptime(most_recent, '%Y-%m-%d %H:%M:%S')
-                pretty = dt.strftime('%d %b %Y, %H:%M')
+                pretty = dt.strftime('%d %b %Y, %I:%M %p')
             except ValueError:
                 pretty = most_recent
             self.root.after(0, lambda t=pretty: self.lbl_last.config(text=f'Last sync: {t}', fg='#4ade80'))
@@ -1681,11 +1720,12 @@ class TallySyncApp:
                 last_sync_at = a.get('last_sync_at')
                 if last_sync_at:
                     try:
-                        from datetime import datetime as _dt, timezone as _tz, timedelta as _td
-                        IST = _tz(_td(hours=5, minutes=30))
-                        dt_utc = _dt.strptime(last_sync_at, '%Y-%m-%d %H:%M:%S').replace(tzinfo=_tz.utc)
-                        dt_ist = dt_utc.astimezone(IST)
-                        last_sync_text = dt_ist.strftime('%d %b %Y, %H:%M') + ' IST'
+                        from datetime import datetime as _dt
+                        # The portal's DB session is IST (see db() in config.php),
+                        # so last_sync_at already comes back in IST — no timezone
+                        # shift needed here anymore.
+                        dt_ist = _dt.strptime(last_sync_at, '%Y-%m-%d %H:%M:%S')
+                        last_sync_text = dt_ist.strftime('%d %b %Y, %I:%M %p') + ' IST'
                     except Exception:
                         last_sync_text = last_sync_at
                 lbl_ls = tk.Label(inf, text=f'Last sync: {last_sync_text}',
@@ -2167,7 +2207,7 @@ class TallySyncApp:
                     self.cfg.remove_option('agent', flag_key)
                 save_cfg(self.cfg)
 
-            now_str = datetime.now().strftime('%d %b %Y, %H:%M')
+            now_str = datetime.now().strftime('%d %b %Y, %I:%M %p')
             def _reset_to_idle(n=company_name, t=now_str, cid=uid):
                 self._co_progress(n, 0, 'Idle', company_id=cid)
                 p = self.co_progress.get(str(cid)) or self.co_progress.get(n)
