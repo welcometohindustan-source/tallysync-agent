@@ -779,6 +779,92 @@ def agent_backup_url(server_url):
     base = server_url.rsplit('/', 1)[0]
     return base + '/agent_backup.php'
 
+_tally_ini_data_root_cache = {'value': None, 'tried': False}
+
+def find_tally_ini_data_root():
+    """
+    Finds the Tally data ROOT folder (the "Data=" line in tally.ini) by
+    locating the actual running Tally.exe and reading tally.ini from the
+    same folder. This is the fallback used when Tally's own DATAPATH/
+    CMPDATAPATH XML fields don't resolve to a real folder on this PC — the
+    data path varies a lot machine to machine (custom drives, client-server
+    setups where the XML path can refer to the server's path, etc.), so the
+    installed Tally's own config file is the most reliable source of truth.
+    Cached for the life of the process — this only needs to run once.
+    """
+    if _tally_ini_data_root_cache['tried']:
+        return _tally_ini_data_root_cache['value']
+    _tally_ini_data_root_cache['tried'] = True
+
+    exe_path = None
+    # Strategy 1: PowerShell (most reliable on modern Windows, incl. Win 11 24H2+
+    # where wmic has been removed)
+    try:
+        import subprocess
+        out = subprocess.run(
+            ['powershell', '-NoProfile', '-Command',
+             "(Get-Process -Name tally,tallyprime,tally9 -ErrorAction SilentlyContinue | "
+             "Select-Object -First 1 -ExpandProperty Path)"],
+            capture_output=True, text=True, timeout=10,
+            creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0
+        )
+        p = (out.stdout or '').strip()
+        if p and os.path.isfile(p):
+            exe_path = p
+    except Exception:
+        pass
+
+    # Strategy 2: wmic (older Windows, still common)
+    if not exe_path:
+        try:
+            import subprocess
+            out = subprocess.run(
+                ['wmic', 'process', 'where', "name='tally.exe' or name='tallyprime.exe'",
+                 'get', 'ExecutablePath'],
+                capture_output=True, text=True, timeout=10,
+                creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0
+            )
+            for line in (out.stdout or '').splitlines():
+                line = line.strip()
+                if line and line.lower() != 'executablepath' and os.path.isfile(line):
+                    exe_path = line; break
+        except Exception:
+            pass
+
+    # Strategy 3: scan common install locations on every drive letter
+    if not exe_path:
+        common_dirs = ['TallyPrime', 'Tally.ERP9', 'Tally9', 'TallyERP9']
+        for drive in 'CDEFGH':
+            for d in common_dirs:
+                for base in (f'{drive}:\\{d}', f'{drive}:\\Program Files\\{d}', f'{drive}:\\Program Files (x86)\\{d}'):
+                    for exe_name in ('tally.exe', 'tallyprime.exe'):
+                        cand = os.path.join(base, exe_name)
+                        if os.path.isfile(cand):
+                            exe_path = cand; break
+                    if exe_path: break
+                if exe_path: break
+            if exe_path: break
+
+    if not exe_path:
+        return None
+
+    ini_path = os.path.join(os.path.dirname(exe_path), 'tally.ini')
+    if not os.path.isfile(ini_path):
+        return None
+
+    try:
+        with open(ini_path, 'r', errors='ignore') as f:
+            for line in f:
+                line = line.strip()
+                if line.lower().startswith('data='):
+                    data_path = line.split('=', 1)[1].strip()
+                    if data_path and os.path.isdir(data_path):
+                        _tally_ini_data_root_cache['value'] = data_path
+                        return data_path
+    except Exception:
+        pass
+    return None
+
 def zip_company_folder(folder_path, tally_number):
     """Zip a Tally company's data folder to a temp file. Returns the zip path, or None."""
     import tempfile, zipfile, os
@@ -2300,6 +2386,16 @@ class TallySyncApp:
                 if last_backup_date != today_bk:
                     co_info = tally_by_num_s.get(portal_num_s) if portal_num_s else None
                     folder  = (co_info or {}).get('path', '')
+                    if not (folder and os.path.isdir(folder)) and portal_num_s:
+                        # Tally's own reported path didn't resolve — fall back to
+                        # the installed Tally's own tally.ini "Data=" line.
+                        ini_root = find_tally_ini_data_root()
+                        if ini_root:
+                            candidate = os.path.join(ini_root, str(portal_num_s))
+                            if os.path.isdir(candidate):
+                                folder = candidate
+                                self.log_append(
+                                    f'Resolved Tally data folder via tally.ini: {folder}', 'dim')
                     if folder and os.path.isdir(folder):
                         _prog(97, 'Backing up Tally data…')
                         self.log_append(
