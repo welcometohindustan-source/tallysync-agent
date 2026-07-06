@@ -888,16 +888,24 @@ def parse_companies(xml):
                 val = fm.group(1).strip()
                 if re.match(r'^\d+$', val) and int(val) > 0:
                     number = val; break
+        # Path: ALWAYS read DATAPATH/CMPDATAPATH — this used to be skipped
+        # whenever `number` was already found via the tags above, which is
+        # the common case, so `path` silently stayed empty for most users
+        # and the daily Tally-folder backup could never find anything to
+        # zip ("Backup skipped — Tally data folder not found"). Also used
+        # as a fallback source for `number` when no explicit tag had it.
         path = ''
-        if not number:
-            for tag in ['DATAPATH', 'CMPDATAPATH']:
-                pm = re.search(rf'<{tag}[^>]*>(.*?)</{tag}>', block, re.I)
-                if pm:
-                    path = pm.group(1).strip()
-                    for part in reversed(re.split(r'[/\\]', path)):
-                        if re.match(r'^\d{5,6}$', part.strip()):
-                            number = part.strip(); break
-                if number: break
+        for tag in ['DATAPATH', 'CMPDATAPATH']:
+            pm = re.search(rf'<{tag}[^>]*>(.*?)</{tag}>', block, re.I)
+            if pm:
+                val = pm.group(1).strip()
+                if val:
+                    path = val
+                    if not number:
+                        for part in reversed(re.split(r'[/\\]', path)):
+                            if re.match(r'^\d{5,6}$', part.strip()):
+                                number = part.strip(); break
+                    break
         companies.append({'name': name, 'guid': guid, 'number': number, 'path': path})
     return companies
 
