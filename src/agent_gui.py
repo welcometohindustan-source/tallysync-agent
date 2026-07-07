@@ -888,46 +888,75 @@ def zip_company_folder(folder_path, tally_number):
         log.error(f'Zip backup failed: {e}')
         return None
 
-def upload_company_backup(server_url, user_id, api_key, secret, tally_number, zip_path, company_name=''):
-    """Upload a zipped Tally company data folder to the portal as a multipart file."""
+def upload_company_backup(server_url, user_id, api_key, secret, tally_number, zip_path, company_name='', progress_cb=None):
+    """
+    Upload a zipped Tally company data folder to the portal in small base64
+    chunks (NOT one large multipart file). upload_max_filesize/post_max_size
+    are php.ini-level settings the portal can't override at runtime, and on
+    shared hosting they're often just a few MB — a single-request upload of
+    a real Tally data folder zip would keep failing with "upload error 1"
+    (UPLOAD_ERR_INI_SIZE) regardless of what the portal script does. Chunking
+    keeps every individual request small enough to clear any reasonable
+    hosting default.
+    """
     import os
+    import urllib.parse
     url = agent_backup_url(server_url)
     try:
-        with open(zip_path, 'rb') as f:
-            file_bytes = f.read()
+        file_size = os.path.getsize(zip_path)
     except Exception as e:
         return {'ok': False, 'error': f'Could not read zip: {e}'}
 
-    boundary = 'TSBackupBnd' + hashlib.md5(file_bytes[:16]).hexdigest()[:8]
-    fname    = os.path.basename(zip_path)
-    parts = [
-        f'--{boundary}\r\nContent-Disposition: form-data; name="uid"\r\n\r\n{user_id}',
-        f'--{boundary}\r\nContent-Disposition: form-data; name="key"\r\n\r\n{api_key}',
-        f'--{boundary}\r\nContent-Disposition: form-data; name="secret"\r\n\r\n{secret}',
-        f'--{boundary}\r\nContent-Disposition: form-data; name="tally_number"\r\n\r\n{tally_number}',
-        f'--{boundary}\r\nContent-Disposition: form-data; name="company_name"\r\n\r\n{company_name}',
-    ]
-    body = ('\r\n'.join(parts) + '\r\n').encode('utf-8')
-    body += (f'--{boundary}\r\nContent-Disposition: form-data; name="backup_file"; filename="{fname}"\r\n'
-             f'Content-Type: application/zip\r\n\r\n').encode('utf-8')
-    body += file_bytes
-    body += f'\r\n--{boundary}--'.encode('utf-8')
+    CHUNK_SIZE = 1_500_000  # raw bytes per chunk (~2MB after base64 encoding)
+    total_chunks = max(1, (file_size + CHUNK_SIZE - 1) // CHUNK_SIZE)
+    fname = os.path.basename(zip_path)
+    backup_id = None
 
-    req = urllib.request.Request(url, data=body,
-        headers={'Content-Type': f'multipart/form-data; boundary={boundary}',
-                 'Content-Length': str(len(body)),
-                 'X-TallySync-Agent': '4.0'},
-        method='POST')
     try:
-        with urllib.request.urlopen(req, timeout=180) as r:
-            resp = r.read().decode('utf-8', errors='replace')
-            try:    return json.loads(resp)
-            except: return {'ok': False, 'error': f'Bad JSON: {resp[:300]}'}
-    except urllib.error.HTTPError as e:
-        body2 = e.read().decode('utf-8', errors='replace')[:400]
-        return {'ok': False, 'error': f'HTTP {e.code}: {body2}'}
-    except Exception as ex:
-        return {'ok': False, 'error': str(ex)}
+        with open(zip_path, 'rb') as f:
+            chunk_no = 1
+            while True:
+                raw = f.read(CHUNK_SIZE)
+                if not raw:
+                    break
+                b64 = base64.b64encode(raw).decode('ascii')
+                fields = {
+                    'uid': user_id, 'key': api_key,
+                    'tally_number': tally_number, 'company_name': company_name,
+                    'chunk_no': str(chunk_no), 'total_chunks': str(total_chunks),
+                    'chunk_data': b64,
+                }
+                if chunk_no == 1:
+                    fields['file_name'] = fname
+                else:
+                    fields['backup_id'] = str(backup_id)
+
+                body = urllib.parse.urlencode(fields).encode('utf-8')
+                req = urllib.request.Request(url, data=body,
+                    headers={'Content-Type': 'application/x-www-form-urlencoded',
+                             'X-TallySync-Agent': '4.0'},
+                    method='POST')
+                try:
+                    with urllib.request.urlopen(req, timeout=120) as r:
+                        resp = json.loads(r.read().decode('utf-8', errors='replace'))
+                except urllib.error.HTTPError as e:
+                    return {'ok': False, 'error': f'HTTP {e.code} on chunk {chunk_no}/{total_chunks}: '
+                                                   f'{e.read().decode("utf-8", errors="replace")[:300]}'}
+                except Exception as ex:
+                    return {'ok': False, 'error': f'Chunk {chunk_no}/{total_chunks} failed: {ex}'}
+
+                if not resp.get('ok'):
+                    return {'ok': False, 'error': f'Chunk {chunk_no}/{total_chunks} rejected: {resp.get("error")}'}
+                if chunk_no == 1:
+                    backup_id = resp.get('backup_id')
+                if progress_cb:
+                    try: progress_cb(chunk_no, total_chunks)
+                    except Exception: pass
+                chunk_no += 1
+
+        return {'ok': True, 'backup_id': backup_id, 'total_chunks': total_chunks}
+    except Exception as e:
+        return {'ok': False, 'error': str(e)}
 
 def discover_companies_on_server(server_url, master_key, master_secret, companies):
     """Tell the portal which Tally companies the agent can see."""
@@ -2402,11 +2431,17 @@ class TallySyncApp:
                             f'Backing up Tally data folder for "{company_name}" (#{portal_num_s})…', 'info')
                         zpath = zip_company_folder(folder, portal_num_s)
                         if zpath:
+                            zsize = os.path.getsize(zpath)
+                            self.log_append(f'Uploading backup ({zsize:,} bytes) in chunks…', 'info')
+                            def _bk_progress(cn, tot, _self=self):
+                                if cn == 1 or cn == tot or cn % 5 == 0:
+                                    _self.log_append(f'  Backup chunk {cn}/{tot} uploaded', 'dim')
                             bres = upload_company_backup(
-                                srv, uid, key, sec, portal_num_s, zpath, company_name=company_name)
+                                srv, uid, key, sec, portal_num_s, zpath, company_name=company_name,
+                                progress_cb=_bk_progress)
                             if bres.get('ok'):
                                 self.log_append(
-                                    f'Backup uploaded ✓ ({os.path.getsize(zpath):,} bytes)', 'ok')
+                                    f'Backup uploaded ✓ ({zsize:,} bytes, {bres.get("total_chunks","?")} chunks)', 'ok')
                                 if not self.cfg.has_section('agent'): self.cfg.add_section('agent')
                                 self.cfg.set('agent', backup_key, today_bk)
                                 save_cfg(self.cfg)
