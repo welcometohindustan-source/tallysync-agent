@@ -173,6 +173,116 @@ def is_configured():
     key = cfg.get('agent','api_key').strip() if cfg.has_option('agent','api_key') else ''
     return bool(uid and key and srv)
 
+# ── Windows "Start with Windows" (system tray autostart) ──────────────────────
+# Uses the per-user registry Run key (HKCU) rather than Task Scheduler, because
+# a Task Scheduler job that runs as SYSTEM cannot show a tray icon in the user's
+# desktop session. HKCU\...\Run requires no admin rights and starts the GUI
+# (minimised to tray via --tray) right after the user logs in.
+AUTOSTART_REG_PATH   = r'Software\Microsoft\Windows\CurrentVersion\Run'
+AUTOSTART_VALUE_NAME = 'BizViewProAgent'
+
+def _autostart_command():
+    """Command line stored in the registry Run key."""
+    if getattr(sys, 'frozen', False):
+        # Compiled EXE (PyInstaller) — launch itself minimised to tray.
+        return f'"{sys.executable}" --tray'
+    # Dev mode — launch via pythonw.exe (no console window) if available.
+    pyw = os.path.join(os.path.dirname(sys.executable), 'pythonw.exe')
+    if not os.path.isfile(pyw):
+        pyw = sys.executable
+    script = os.path.abspath(sys.argv[0])
+    return f'"{pyw}" "{script}" --tray'
+
+def is_autostart_enabled():
+    """True if the agent is currently registered to start with Windows."""
+    if sys.platform != 'win32':
+        return False
+    try:
+        import winreg
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, AUTOSTART_REG_PATH,
+                              0, winreg.KEY_READ)
+        try:
+            val, _ = winreg.QueryValueEx(key, AUTOSTART_VALUE_NAME)
+            return bool(val)
+        finally:
+            winreg.CloseKey(key)
+    except Exception:
+        return False
+
+def set_autostart(enable):
+    """Enable/disable auto-launch (minimised to tray) on Windows login.
+    Returns (ok: bool, error: str)."""
+    if sys.platform != 'win32':
+        return False, 'Auto-start with Windows is only supported on Windows.'
+    try:
+        import winreg
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, AUTOSTART_REG_PATH,
+                              0, winreg.KEY_SET_VALUE)
+        try:
+            if enable:
+                winreg.SetValueEx(key, AUTOSTART_VALUE_NAME, 0, winreg.REG_SZ,
+                                   _autostart_command())
+            else:
+                try:
+                    winreg.DeleteValue(key, AUTOSTART_VALUE_NAME)
+                except FileNotFoundError:
+                    pass
+        finally:
+            winreg.CloseKey(key)
+        return True, ''
+    except Exception as e:
+        return False, str(e)
+
+def find_tally_exe_path():
+    """Locate tally.exe / tallyprime.exe on disk — works even when Tally is
+    NOT currently running (unlike find_tally_ini_data_root's process lookup),
+    so it can be used to launch Tally from the "Open Tally" button."""
+    if sys.platform != 'win32':
+        return None
+    # 1) Windows "App Paths" registry — most installers register this.
+    try:
+        import winreg
+        for exe_name in ('tally.exe', 'tallyprime.exe'):
+            for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+                try:
+                    k = winreg.OpenKey(
+                        hive,
+                        r'SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\%s' % exe_name)
+                    try:
+                        val, _ = winreg.QueryValueEx(k, '')
+                        if val and os.path.isfile(val):
+                            return val
+                    finally:
+                        winreg.CloseKey(k)
+                except OSError:
+                    continue
+    except Exception:
+        pass
+    # 2) Scan common install locations (same drives/dirs used elsewhere in this file).
+    common_dirs = ['TallyPrime', 'Tally.ERP9', 'Tally9', 'TallyERP9']
+    for drive in 'CDEFGH':
+        for d in common_dirs:
+            for base in (f'{drive}:\\{d}', f'{drive}:\\Program Files\\{d}',
+                         f'{drive}:\\Program Files (x86)\\{d}'):
+                for exe_name in ('tally.exe', 'tallyprime.exe'):
+                    cand = os.path.join(base, exe_name)
+                    if os.path.isfile(cand):
+                        return cand
+    return None
+
+def _is_tally_unreachable_error(e):
+    """True if the exception looks like 'nothing is listening on the Tally
+    ODBC/XML port' (i.e. TallyPrime just isn't open) rather than some other
+    failure (bad URL, portal down, auth error, etc). Covers the common
+    variants: WinError 10061 (connection refused), urlopen errors, and
+    generic 'connection refused'/'actively refused' phrasing."""
+    msg = str(e).lower()
+    return any(s in msg for s in (
+        '10061', 'connection refused', 'actively refused',
+        'urlopen error', 'connection reset', 'target machine actively',
+        'econnrefused',
+    ))
+
 # ── Network helpers ───────────────────────────────────────────────────────────
 
 def tally_post(host, xml, timeout=120):
@@ -1040,8 +1150,13 @@ class TallySyncApp:
         self._next_sync = time.time() + self._interval_secs()
         self._pause_remaining = 0   # seconds left on countdown when Pause was pressed
         self._settings_win = None
+        self._tally_connected = False   # tracks last-known Tally reachability (for UI + auto-refresh)
         self._build_ui()
         self.root.after(500, self._auto_connect)
+        # Start the 30s auto-refresh loop unconditionally — this is what lets the
+        # agent pick up Tally companies automatically once TallyPrime is opened,
+        # even if the very first connect attempt happened while Tally was closed.
+        self._start_auto_refresh()
         self._tick()
 
     def _interval_secs(self):
@@ -1180,6 +1295,13 @@ class TallySyncApp:
         self.lbl_status = tk.Label(sb, text='Connecting…', bg='#eef4ff', fg=MUTED,
                                     font=('Segoe UI', 10))
         self.lbl_status.pack(side='left')
+        # "Open Tally" button — hidden by default, shown only when Tally isn't
+        # reachable so the user can launch it with one click.
+        self.btn_open_tally = tk.Button(sb, text='🚀  Open Tally', command=self._open_tally,
+                                         bg=BLUE, fg='white', font=('Segoe UI', 8, 'bold'),
+                                         relief='flat', cursor='hand2', padx=8, pady=2, bd=0,
+                                         activebackground=BLUE_DK, activeforeground='white')
+        # not packed here — shown/hidden via _show_open_tally_button()
 
         # ── Company card (white, rounded border) ──────────────────────────────
         card = tk.Frame(self.root, bg=WHITE, highlightthickness=1,
@@ -1273,8 +1395,16 @@ class TallySyncApp:
         self.root.after(1000, self._tick)
 
     def _refresh_tally_companies(self):
-        """Silently re-fetch open companies from Tally and update self.companies.
-        Called 10s before auto-sync so skip-logic reflects current Tally state."""
+        """Re-fetch open companies from Tally and update self.companies. Runs
+        every 30s (see _start_auto_refresh) and also 10s before auto-sync.
+
+        This is also what detects TallyPrime being opened (or closed) after
+        the app started — if we were previously disconnected and Tally is now
+        reachable, it runs the full connect/portal-discovery flow so company
+        list appears automatically with no user action needed. If Tally
+        becomes unreachable, it clears the (now stale) company list so closed
+        companies aren't shown as available.
+        """
         try:
             def _gcfg(k, default=''):
                 return self.cfg.get('agent', k).strip() if self.cfg.has_option('agent', k) else default
@@ -1282,6 +1412,19 @@ class TallySyncApp:
             xml   = fetch_companies(host)
             fresh = parse_companies(xml)
             if fresh is not None:
+                was_disconnected = not self._tally_connected
+                self._tally_connected = True
+
+                if was_disconnected or not self.assigned:
+                    # Tally just became reachable (or we never finished the
+                    # portal handshake, e.g. first launch happened while
+                    # Tally was closed) — run the full connect flow so the
+                    # portal-assigned company list loads automatically.
+                    self.log_append('TallyPrime detected — connecting…', 'ok')
+                    self._show_open_tally_button(False)
+                    self._do_connect()   # runs synchronously on this bg thread
+                    return
+
                 old_names = {c['name'] for c in self.companies}
                 new_names = {c['name'] for c in fresh}
                 self.companies = fresh
@@ -1294,18 +1437,30 @@ class TallySyncApp:
                 # Re-render on any change (open/close) to update status + hint
                 if opened or closed:
                     self.root.after(0, self._render_companies)
+        except Exception as e:
+            # Tally unreachable — clear stale company list (don't show companies
+            # that may no longer actually be open) and show the friendly status
+            # + Open Tally button instead of leaving old data on screen.
+            if self._tally_connected or self.companies:
+                self._tally_connected = False
+                self.companies = []
+                self.root.after(0, self._render_companies)
+                if _is_tally_unreachable_error(e):
+                    self._set_tally_not_open_status()
                 else:
-                    # Even if names didn't change, re-render to update progress bar states
-                    # This is cheap (just rebuilds the lightweight tkinter widgets)
-                    pass
-        except Exception:
-            pass  # Silent — don't disturb the user before sync
+                    self._show_open_tally_button(True)
 
     def _start_auto_refresh(self):
         """Start periodic auto-refresh of company open/close status.
-        Runs every 30 seconds. Skipped during active sync.
-        Also does an immediate first refresh after 5 seconds.
+        Runs every 30 seconds, forever, regardless of whether Tally/portal are
+        currently reachable — this is what detects TallyPrime being opened
+        later and loads its companies automatically. Skipped during active sync.
+        Also does an immediate first refresh after 5 seconds. Guarded so it
+        only ever starts one loop even if called more than once.
         """
+        if getattr(self, '_auto_refresh_started', False):
+            return
+        self._auto_refresh_started = True
         def _tick_refresh():
             if not self.syncing:
                 try:
@@ -1351,7 +1506,7 @@ class TallySyncApp:
             return
         win = tk.Toplevel(self.root)
         win.title('BizView Pro — Settings')
-        win.geometry('460x540')
+        win.geometry('460x580')
         win.resizable(False, False)
         win.configure(bg='#f0f4f8')
         win.grab_set()
@@ -1412,6 +1567,32 @@ class TallySyncApp:
         interval_cb.bind('<<ComboboxSelected>>', self._on_interval_change)
         tk.Label(irow, text='minutes', bg='#f0f4f8', fg='#6b7280',
                  font=('Segoe UI', 9)).pack(side='left', padx=(6, 0))
+
+        # ── Start with Windows ────────────────────────────────────────────────
+        srow = tk.Frame(body, bg='#f0f4f8')
+        srow.pack(fill='x', pady=(8, 3))
+        autostart_var = tk.BooleanVar(value=is_autostart_enabled())
+        def _toggle_autostart():
+            ok, err = set_autostart(autostart_var.get())
+            if ok:
+                state = 'enabled' if autostart_var.get() else 'disabled'
+                lbl_ok.config(text=f'✓  Start with Windows {state}', fg='#059669')
+                win.after(2500, lambda: lbl_ok.config(text=''))
+                self.log_append(f'Start with Windows {state}.', 'ok')
+            else:
+                autostart_var.set(not autostart_var.get())  # revert checkbox
+                messagebox.showerror('Could not update startup setting', err)
+        autostart_chk = tk.Checkbutton(
+            srow, text='Start automatically when Windows starts (minimised to system tray)',
+            variable=autostart_var, command=_toggle_autostart,
+            bg='#f0f4f8', fg='#374151', font=('Segoe UI', 9),
+            activebackground='#f0f4f8', selectcolor='white',
+            anchor='w', wraplength=400, justify='left')
+        autostart_chk.pack(anchor='w')
+        if sys.platform != 'win32':
+            autostart_chk.config(state='disabled')
+            tk.Label(srow, text='(Windows only)', bg='#f0f4f8', fg='#9ca3af',
+                     font=('Segoe UI', 8)).pack(anchor='w', padx=(20, 0))
 
         # ── Action buttons row ────────────────────────────────────────────────
         tk.Frame(body, bg='#e5e7eb', height=1).pack(fill='x', pady=(12, 10))
@@ -1551,17 +1732,24 @@ class TallySyncApp:
             elif not (mkey and msec):
                 self.log_append('master_key/master_secret not set — add them to config.ini (see Sync Tally page on the portal)', 'warn')
 
+            self._tally_connected = True
+            self._show_open_tally_button(False)
             self.root.after(0, self._render_companies)
             active_count = len([a for a in self.assigned]) if self.assigned else len(cos)
             self._set_status(f'TallyPrime Connected  ({active_count} active company found)', '#4ade80')
             self.log_append(f'Connected — {len(cos)} company', 'ok')
-            # Start periodic 60s refresh if not already started
-            if not getattr(self, '_auto_refresh_started', False):
-                self._auto_refresh_started = True
-                self._start_auto_refresh()
+            # The 30s auto-refresh loop is already running (started at app launch)
+            # and will keep picking up open/close changes from here on.
         except Exception as e:
-            self._set_status(f'Not connected: {str(e)[:55]}', '#f87171')
-            self.log_append(f'Connect failed: {e}', 'error')
+            self._tally_connected = False
+            self.companies = []   # don't show stale companies while Tally is closed
+            self.root.after(0, self._render_companies)
+            if _is_tally_unreachable_error(e):
+                self._set_tally_not_open_status(str(e))
+            else:
+                self._set_status(f'Not connected: {str(e)[:55]}', '#f87171')
+                self._show_open_tally_button(True)
+                self.log_append(f'Connect failed: {e}', 'error')
 
     def _force_full_resync(self, company):
         """Clear local watermarks for this company and trigger a full resync."""
@@ -1651,6 +1839,48 @@ class TallySyncApp:
     def _set_status(self, msg, color):
         self.root.after(0, lambda: self.lbl_status.config(text=msg, fg=color, bg='#eef4ff'))
         self.root.after(0, lambda: self.dot.config(fg=color, bg='#eef4ff'))
+
+    def _show_open_tally_button(self, show):
+        def _apply():
+            if show:
+                self.btn_open_tally.pack(side='left', padx=(10, 0))
+            else:
+                self.btn_open_tally.pack_forget()
+        self.root.after(0, _apply)
+
+    def _set_tally_not_open_status(self, raw_error=''):
+        """Friendly status shown when TallyPrime isn't running — replaces the
+        raw urllib/WinError text with a plain-language message + a one-click
+        'Open Tally' button, instead of a scary red stack-trace-looking string."""
+        self._set_status('TallyPrime is not open yet', '#f87171')
+        self._show_open_tally_button(True)
+        if raw_error:
+            self.log_append(f'Connect failed (Tally not open): {raw_error}', 'warn')
+
+    def _open_tally(self):
+        """Try to launch TallyPrime from the 'Open Tally' button."""
+        def _launch():
+            self.root.after(0, lambda: self._set_status('Starting TallyPrime…', '#fcd34d'))
+            path = find_tally_exe_path()
+            if path:
+                try:
+                    if sys.platform == 'win32':
+                        os.startfile(path)
+                    self.log_append(f'Launching TallyPrime: {path}', 'ok')
+                    self.log_append('Waiting for TallyPrime to start — companies will load automatically.', 'info')
+                except Exception as e:
+                    self.log_append(f'Could not launch TallyPrime: {e}', 'error')
+                    self.root.after(0, lambda: messagebox.showerror(
+                        'Could not start TallyPrime', str(e)))
+                    self.root.after(0, lambda: self._set_tally_not_open_status())
+            else:
+                self.root.after(0, lambda: messagebox.showwarning(
+                    'TallyPrime not found',
+                    "Couldn't find TallyPrime automatically on this PC.\n\n"
+                    "Please open TallyPrime manually — the agent checks every "
+                    "30 seconds and will detect it and load companies automatically."))
+                self.root.after(0, lambda: self._set_tally_not_open_status())
+        threading.Thread(target=_launch, daemon=True).start()
 
     def _sync_watermarks_from_server(self):
         """Pull each active company's last_voucher_alterid from portal and sync
@@ -1993,10 +2223,22 @@ class TallySyncApp:
                           lambda e, u=portal_url: __import__('webbrowser').open(u))
 
         if not self.assigned and not self.pending_setup and not self.companies:
-            tk.Label(self.co_frame,
-                     text='Click Connect to detect companies from TallyPrime.',
-                     bg='white', fg='#9ca3af',
-                     font=('Segoe UI', 9)).pack(anchor='w', padx=10, pady=6)
+            if not self._tally_connected:
+                ph = tk.Frame(self.co_frame, bg='white')
+                ph.pack(fill='x', padx=10, pady=14)
+                tk.Label(ph, text='⏳  TallyPrime is not open yet',
+                         bg='white', fg='#6b7280',
+                         font=('Segoe UI', 10, 'bold')).pack(anchor='w')
+                tk.Label(ph, text='Open TallyPrime and this list will fill in automatically —\n'
+                                   'no need to click Connect.',
+                         bg='white', fg='#9ca3af', font=('Segoe UI', 9),
+                         justify='left').pack(anchor='w', pady=(2, 8))
+                self._btn(ph, '🚀  Open Tally', self._open_tally, 'primary').pack(anchor='w')
+            else:
+                tk.Label(self.co_frame,
+                         text='Click Connect to detect companies from TallyPrime.',
+                         bg='white', fg='#9ca3af',
+                         font=('Segoe UI', 9)).pack(anchor='w', padx=10, pady=6)
 
     # ── SYNC ─────────────────────────────────────────────────────────────────
 
