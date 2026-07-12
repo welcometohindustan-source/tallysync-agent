@@ -444,6 +444,24 @@ def fetch_stock(host, company=''):
          'CLOSINGBALANCE','CLOSINGVALUE','RATE','OPENINGBALANCE','OPENINGVALUE'],
         company=company), timeout=60)
 
+def fetch_voucher_types(host, company=''):
+    """Voucher Types master — PARENT gives the real base type (Sales,
+    Purchase, Payment, Receipt, Journal...) for whatever custom name the
+    company actually uses (e.g. 'Tax Invoice' with PARENT='Sales'). Lets the
+    portal classify custom voucher type names accurately instead of guessing
+    from the name alone."""
+    return tally_post(host, collection_xml('TSVchTypes','VoucherType',
+        ['GUID','ALTERID','NAME','PARENT','AFFECTSSTOCK','ISDEEMEDPOSITIVE'],
+        company=company), timeout=60)
+
+def fetch_godowns(host, company=''):
+    """Godowns/warehouses master — not consumed by any report yet, synced
+    proactively so godown-wise stock reporting can be built later without
+    needing another agent release just to backfill history."""
+    return tally_post(host, collection_xml('TSGdn','Godown',
+        ['GUID','ALTERID','NAME','PARENT'],
+        company=company), timeout=60)
+
 VOUCHER_FETCH_FIELDS = (
     'GUID,ALTERID,MASTERID,DATE,VOUCHERTYPENAME,VOUCHERNUMBER,ISOPTIONAL,ISDELETED,'
     'PARTYLEDGERNAME,NARRATION,'
@@ -2458,6 +2476,49 @@ class TallySyncApp:
             time.sleep(0.5)
             _prog( 35, 'Masters done.')
 
+            # ── 2b. Voucher Types ────────────────────────────────────────────────
+            # Small, low-churn master — full fetch every sync (cheap, no need for
+            # incremental complexity here). This is what lets the portal correctly
+            # classify a custom-named voucher type (e.g. "Tax Invoice") as a Sales
+            # voucher by its real Tally PARENT, instead of guessing from the name.
+            _prog( 36, 'Fetching voucher types…')
+            try:
+                xml = fetch_voucher_types(host, company=company or '')
+                self.log_append(f'Voucher types: {len(xml):,} bytes from Tally', 'dim')
+                if '<VOUCHERTYPE' in xml.upper():
+                    bundle = build_bundle(uid, 'voucher_types', xml)
+                    res    = send_bundle(srv, uid, key, bundle, cmp_, enc_, sec)
+                    saved  = res.get('saved', 0) if res.get('ok') else 0
+                    self.log_append(f'Voucher types: {saved} saved', 'ok' if res.get('ok') else 'error')
+                    if not res.get('ok'):
+                        self.log_append(f'  └ {res.get("error")}', 'error')
+            except Exception as e:
+                self.log_append(f'Voucher types sync skipped: {e}', 'warn')
+
+            if self.stop_flag: raise Exception('Stopped')
+            time.sleep(0.3)
+
+            # ── 2c. Godowns ──────────────────────────────────────────────────────
+            # Not used by any report yet — synced proactively so it's already
+            # there once godown-wise stock reporting is built.
+            _prog( 37, 'Fetching godowns…')
+            try:
+                xml = fetch_godowns(host, company=company or '')
+                self.log_append(f'Godowns: {len(xml):,} bytes from Tally', 'dim')
+                if '<GODOWN' in xml.upper():
+                    bundle = build_bundle(uid, 'godowns', xml)
+                    res    = send_bundle(srv, uid, key, bundle, cmp_, enc_, sec)
+                    saved  = res.get('saved', 0) if res.get('ok') else 0
+                    self.log_append(f'Godowns: {saved} saved', 'ok' if res.get('ok') else 'error')
+                    if not res.get('ok'):
+                        self.log_append(f'  └ {res.get("error")}', 'error')
+            except Exception as e:
+                self.log_append(f'Godowns sync skipped: {e}', 'warn')
+
+            if self.stop_flag: raise Exception('Stopped')
+            time.sleep(0.3)
+            _prog( 38, 'Masters done.')
+
             # ── Save master AlterID watermark ─────────────────────────────────
             if max_master_alterid > last_master_alterid:
                 if not self.cfg.has_section('agent'):
@@ -3031,6 +3092,24 @@ def run_once_headless():
                 res = send_bundle(srv,uid,key,build_bundle(uid,"stock",xml),cmp_,enc_,sec)
                 log.info(f"[{uid}{label}] Stock: {res}")
             time.sleep(1.1)
+
+            try:
+                xml = fetch_voucher_types(host, company=cname)
+                if "<VOUCHERTYPE" in xml.upper():
+                    res = send_bundle(srv,uid,key,build_bundle(uid,"voucher_types",xml),cmp_,enc_,sec)
+                    log.info(f"[{uid}{label}] Voucher types: {res}")
+            except Exception as e:
+                log.warning(f"[{uid}{label}] Voucher types sync skipped: {e}")
+            time.sleep(0.6)
+
+            try:
+                xml = fetch_godowns(host, company=cname)
+                if "<GODOWN" in xml.upper():
+                    res = send_bundle(srv,uid,key,build_bundle(uid,"godowns",xml),cmp_,enc_,sec)
+                    log.info(f"[{uid}{label}] Godowns: {res}")
+            except Exception as e:
+                log.warning(f"[{uid}{label}] Godowns sync skipped: {e}")
+            time.sleep(0.6)
 
             alterid_key  = ('last_voucher_alterid__' + re.sub(r'[/\\\s]', '_', cname)) if cname else 'last_voucher_alterid'
             last_alterid = int(_g(alterid_key, '0') or '0')
