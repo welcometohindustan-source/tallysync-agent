@@ -447,11 +447,13 @@ def fetch_stock(host, company=''):
 def fetch_voucher_types(host, company=''):
     """Voucher Types master — PARENT gives the real base type (Sales,
     Purchase, Payment, Receipt, Journal...) for whatever custom name the
-    company actually uses (e.g. 'Tax Invoice' with PARENT='Sales'). Lets the
-    portal classify custom voucher type names accurately instead of guessing
-    from the name alone."""
+    company actually uses (e.g. 'Tax Invoice' with PARENT='Sales').
+    PRINTTITLE is Tally's own 'Default title to print' setting on the
+    voucher type — when set, THIS is what should appear as the document
+    heading on a generated bill (e.g. a company might print all their Sales
+    vouchers titled 'Delivery Challan'), not a guess based on the type name."""
     return tally_post(host, collection_xml('TSVchTypes','VoucherType',
-        ['GUID','ALTERID','NAME','PARENT','AFFECTSSTOCK','ISDEEMEDPOSITIVE'],
+        ['GUID','ALTERID','NAME','PARENT','AFFECTSSTOCK','ISDEEMEDPOSITIVE','PRINTTITLE'],
         company=company), timeout=60)
 
 def fetch_godowns(host, company=''):
