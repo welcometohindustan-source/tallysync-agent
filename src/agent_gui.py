@@ -910,6 +910,81 @@ def agent_backup_url(server_url):
     base = server_url.rsplit('/', 1)[0]
     return base + '/agent_backup.php'
 
+def voucher_push_pull_url(server_url):
+    """Derive api/voucher_push_pull.php from the configured ingest URL."""
+    if server_url.endswith('ingest.php'):
+        return server_url[:-len('ingest.php')] + 'voucher_push_pull.php'
+    base = server_url.rsplit('/', 1)[0]
+    return base + '/voucher_push_pull.php'
+
+def voucher_push_result_url(server_url):
+    """Derive api/voucher_push_result.php from the configured ingest URL."""
+    if server_url.endswith('ingest.php'):
+        return server_url[:-len('ingest.php')] + 'voucher_push_result.php'
+    base = server_url.rsplit('/', 1)[0]
+    return base + '/voucher_push_result.php'
+
+def push_pending_vouchers(host, srv, uid, key, log=None):
+    """
+    Portal -> Tally direction: pulls any Payment/Receipt vouchers queued on
+    the portal (voucher-new.php), posts each one's ready-built XML straight
+    to the local Tally, and reports Tally's raw response back to the portal.
+    All the voucher-structure / double-entry logic lives portal-side
+    (buildPaymentReceiptVoucherXml in tally_client.php) — the agent is just
+    the relay between the portal queue and the local Tally instance, same
+    role it already plays for the reverse (Tally -> portal) direction.
+    Returns (pushed_count, failed_count).
+    """
+    def _log(msg, kind='info'):
+        if log: log(msg, kind)
+
+    pull_url = voucher_push_pull_url(srv)
+    res = simple_post(pull_url, {'uid': uid, 'key': key}, timeout=30)
+    if not isinstance(res, dict) or not res.get('ok'):
+        # Not every portal instance will have this endpoint yet (e.g. before
+        # migration 010 runs) — fail quietly rather than spamming the log.
+        return (0, 0)
+    pending = res.get('pending') or []
+    if not pending:
+        return (0, 0)
+
+    _log(f'Pushing {len(pending)} queued voucher(s) into Tally…', 'info')
+    result_url = voucher_push_result_url(srv)
+    pushed = 0
+    failed = 0
+    for item in pending:
+        push_id = item.get('push_id')
+        xml     = item.get('xml', '')
+        if not push_id or not xml:
+            continue
+        try:
+            tally_resp = tally_post(host, xml, timeout=60)
+            rres = simple_post(result_url, {
+                'uid': uid, 'key': key, 'push_id': push_id,
+                'tally_response': tally_resp or '',
+            }, timeout=30)
+            outcome = rres.get('result') if isinstance(rres, dict) else None
+            if outcome == 'failed':
+                failed += 1
+                _log(f'  Voucher push #{push_id} failed: {rres.get("error","unknown error")}', 'warn')
+            elif outcome == 'awaiting_confirmation':
+                pushed += 1
+                _log(f'  Voucher push #{push_id} sent to Tally — will confirm on next sync.', 'ok')
+            elif outcome == 'requeued':
+                _log(f'  Voucher push #{push_id} requeued: {rres.get("reason","")}', 'warn')
+        except Exception as e:
+            # Couldn't even reach Tally — tell the portal so it requeues
+            # rather than leaving this stuck in 'sending'.
+            try:
+                simple_post(result_url, {
+                    'uid': uid, 'key': key, 'push_id': push_id, 'agent_error': str(e),
+                }, timeout=30)
+            except Exception:
+                pass
+            failed += 1
+            _log(f'  Voucher push #{push_id}: could not reach Tally ({e})', 'warn')
+    return (pushed, failed)
+
 _tally_ini_data_root_cache = {'value': None, 'tried': False}
 
 def find_tally_ini_data_root():
@@ -2041,7 +2116,11 @@ class TallySyncApp:
             portal_num = a.get('tally_number','')
             # If portal has a stored number AND Tally reported numbers — use number match
             if portal_num and tally_by_number:
-                return portal_num in tally_by_number
+                if portal_num in tally_by_number:
+                    return True
+                # Number didn't match anything Tally currently reports (e.g. the
+                # data folder was recreated and Tally reassigned the number) —
+                # don't assume closed, fall through to name match below instead.
             # Fallback: name match (when number not yet stored or Tally didn't return it)
             return a.get('name','') in tally_open_names
 
@@ -2062,6 +2141,12 @@ class TallySyncApp:
                 # Show [number] suffix whenever we have it (makes same-name companies clear)
                 if num:
                     cname = f'{cname}  [{num}]'
+                # Truncate long names for display only — 'cname' itself stays intact
+                # since it's used elsewhere as a lookup key (self.co_progress[cname]).
+                display_name = cname
+                if len(display_name) > 30:
+                    base = a['name'][:30].rstrip() + '...'
+                    display_name = f'{base}  [{num}]' if num else base
                 is_open    = _co_is_open(a)
 
                 # ── Separator ────────────────────────────────────────────────
@@ -2080,7 +2165,7 @@ class TallySyncApp:
 
                 # Company name — grey out if not open in Tally
                 name_color = '#111827' if is_open else '#9ca3af'
-                tk.Label(inf, text=cname, bg='white', fg=name_color,
+                tk.Label(inf, text=display_name, bg='white', fg=name_color,
                          font=('Segoe UI', 10, 'bold'), anchor='w').pack(anchor='w')
 
                 # Status sub-label
@@ -2672,6 +2757,18 @@ class TallySyncApp:
                         self.log_append(f'Renumber: all {chk} numbers match ✓', 'info')
             except Exception as rne:
                 self.log_append(f'Renumber check skipped: {rne}', 'warn')
+
+            # ── Push queued Payment/Receipt vouchers into Tally ───────────────────
+            # Reverse direction of normal sync: vouchers created on the portal
+            # (voucher-new.php) waiting to be created in Tally. Runs every cycle
+            # (not daily-throttled) so a pushed voucher reaches Tally promptly.
+            try:
+                _prog(96, 'Pushing queued vouchers…')
+                pushed, failed = push_pending_vouchers(host, srv, uid, key, log=self.log_append)
+                if pushed or failed:
+                    self.log_append(f'Voucher push: {pushed} sent, {failed} failed.', 'ok' if not failed else 'warn')
+            except Exception as pve:
+                self.log_append(f'Voucher push check skipped: {pve}', 'warn')
 
             # ── Daily deleted-voucher check ──────────────────────────────────────
             # See fetch_voucher_guids_for_presence_check()'s docstring: Tally gives
