@@ -4,6 +4,15 @@ on:
   push:
     branches: [ main, master ]
   workflow_dispatch:
+    inputs:
+      channel:
+        description: 'Release channel to publish to. "beta" is safe for testing — the website download link always points at "latest" and is unaffected. Choose "latest" only after you have tested the beta build.'
+        required: true
+        default: 'beta'
+        type: choice
+        options:
+          - beta
+          - latest
 
 permissions:
   contents: write   # needed to create GitHub Releases
@@ -15,6 +24,19 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Determine release channel
+        id: channel
+        shell: pwsh
+        run: |
+          # Pushes (including to main) always build to "beta" — safe, does not
+          # touch the "latest" tag the website's download-agent.php serves.
+          # Publishing to "latest" only happens via a manual "Run workflow"
+          # with channel=latest explicitly selected.
+          $ch = "${{ github.event.inputs.channel }}"
+          if ([string]::IsNullOrEmpty($ch)) { $ch = "beta" }
+          echo "channel=$ch" >> $env:GITHUB_OUTPUT
+          Write-Host "Publishing to release channel: $ch"
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
@@ -111,23 +133,24 @@ jobs:
           echo "tag=v$ts-$sha" >> $env:GITHUB_OUTPUT
           echo "name=BizView Pro Agent $ts" >> $env:GITHUB_OUTPUT
 
-      - name: Delete existing 'latest' release and tag (if any)
+      - name: Delete existing release and tag for this channel (if any)
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CHANNEL: ${{ steps.channel.outputs.channel }}
         run: |
-          gh release delete latest --yes --cleanup-tag 2>$null
-          git tag -d latest 2>$null
-          git push --delete origin latest 2>$null
+          gh release delete $env:CHANNEL --yes --cleanup-tag 2>$null
+          git tag -d $env:CHANNEL 2>$null
+          git push --delete origin $env:CHANNEL 2>$null
           exit 0
 
-      - name: Create GitHub Release (latest)
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: latest
-          name: "BizView Pro Agent — Latest Build"
+          tag_name: ${{ steps.channel.outputs.channel }}
+          name: "BizView Pro Agent — ${{ steps.channel.outputs.channel == 'latest' && 'Latest (Live on Website)' || 'Beta (Testing Only)' }}"
           body: |
-            **Auto-published on every push to main.**
+            ${{ steps.channel.outputs.channel == 'latest' && '**This is the LIVE build served by the website download link.**' || '**BETA build for testing — the website download link is unaffected by this release.** Download the assets below directly from this page to test.' }}
 
             ### Downloads
             | File | Description |
@@ -136,8 +159,8 @@ jobs:
             | `BizViewProAgent.exe` | Portable EXE — run directly, no install needed |
 
             Built from commit ${{ github.sha }} on ${{ github.ref_name }}
-          prerelease: false
-          make_latest: true
+          prerelease: ${{ steps.channel.outputs.channel != 'latest' }}
+          make_latest: ${{ steps.channel.outputs.channel == 'latest' }}
           fail_on_unmatched_files: false
           files: |
             installer/BizViewProSetup.zip
@@ -148,6 +171,6 @@ jobs:
       - name: Upload artifacts (also kept for 30 days)
         uses: actions/upload-artifact@v4
         with:
-          name: BizViewProSetup-Installer
+          name: BizViewProSetup-Installer-${{ steps.channel.outputs.channel }}
           path: installer/BizViewProSetup.zip
           retention-days: 30
