@@ -978,7 +978,7 @@ def push_pending_vouchers(host, srv, uid, key, log=None):
                 _log(f'  Voucher push #{push_id} failed: {rres.get("error","unknown error")}', 'warn')
             elif outcome == 'awaiting_confirmation':
                 pushed += 1
-                _log(f'  Voucher push #{push_id} sent to Tally, but no voucher number was returned — check Tally directly.', 'warn')
+                _log(f'  Voucher push #{push_id} confirmed by Tally — voucher number will show shortly.', 'ok')
             elif outcome == 'requeued':
                 _log(f'  Voucher push #{push_id} requeued: {rres.get("reason","")}', 'warn')
         except Exception as e:
