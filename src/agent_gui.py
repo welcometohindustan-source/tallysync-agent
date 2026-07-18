@@ -941,8 +941,13 @@ def push_pending_vouchers(host, srv, uid, key, log=None):
     pull_url = voucher_push_pull_url(srv)
     res = simple_post(pull_url, {'uid': uid, 'key': key}, timeout=30)
     if not isinstance(res, dict) or not res.get('ok'):
-        # Not every portal instance will have this endpoint yet (e.g. before
-        # migration 010 runs) — fail quietly rather than spamming the log.
+        # Log this instead of failing silently — a wrong URL, a 404 (file not
+        # yet uploaded to /api/ on the server), an auth mismatch, or the
+        # portal not having this feature yet all land here, and previously
+        # produced zero trace in the log, which made this impossible to
+        # diagnose. Now it's visible (rate-limited to once per sync cycle).
+        err = res.get('error', 'no response') if isinstance(res, dict) else 'no response'
+        _log(f'Voucher push check: could not reach voucher queue at {pull_url} ({err})', 'dim')
         return (0, 0)
     pending = res.get('pending') or []
     if not pending:
@@ -964,12 +969,16 @@ def push_pending_vouchers(host, srv, uid, key, log=None):
                 'tally_response': tally_resp or '',
             }, timeout=30)
             outcome = rres.get('result') if isinstance(rres, dict) else None
-            if outcome == 'failed':
+            if outcome == 'synced':
+                pushed += 1
+                vno = rres.get('voucher_no', '?')
+                _log(f'  Voucher push #{push_id} confirmed by Tally — voucher no. {vno}.', 'ok')
+            elif outcome == 'failed':
                 failed += 1
                 _log(f'  Voucher push #{push_id} failed: {rres.get("error","unknown error")}', 'warn')
             elif outcome == 'awaiting_confirmation':
                 pushed += 1
-                _log(f'  Voucher push #{push_id} sent to Tally — will confirm on next sync.', 'ok')
+                _log(f'  Voucher push #{push_id} sent to Tally, but no voucher number was returned — check Tally directly.', 'warn')
             elif outcome == 'requeued':
                 _log(f'  Voucher push #{push_id} requeued: {rres.get("reason","")}', 'warn')
         except Exception as e:
@@ -1749,6 +1758,27 @@ class TallySyncApp:
                   activebackground='#334155', activeforeground='white',
                   command=_open_logs).pack(side='left', padx=(8, 0))
 
+        # Diagnose Item Description button — Amber. Only useful if the
+        # description bug is still unresolved after the tally_client.php
+        # regex fix; pinpoints whether Tally is even sending the data.
+        def _run_diagnose_description():
+            host_val = self.cfg.get('agent','tally_host').strip() if self.cfg.has_option('agent','tally_host') else 'http://localhost:9000'
+            company_val = ''
+            if self.assigned:
+                company_val = self.assigned[0].get('name','')
+            elif self.companies:
+                company_val = self.companies[0].get('name','')
+            lbl_test_result.config(text='Diagnosing item description…', fg='#6b7280')
+            win.update_idletasks()
+            threading.Thread(target=self._diagnose_item_description,
+                              args=(host_val, company_val, lbl_test_result), daemon=True).start()
+
+        tk.Button(btn_row1, text='🩺  Diagnose Description',
+                  bg='#b45309', fg='white', font=('Segoe UI', 10),
+                  relief='flat', cursor='hand2', padx=14, pady=8, bd=0,
+                  activebackground='#92400e', activeforeground='white',
+                  command=_run_diagnose_description).pack(side='left', padx=(8, 0))
+
         lbl_test_result.pack(anchor='w', pady=(4, 0))
         lbl_ok = tk.Label(body, text='', bg='#f0f4f8', font=('Segoe UI', 9))
         lbl_ok.pack(anchor='w', pady=(2, 0))
@@ -2465,6 +2495,19 @@ class TallySyncApp:
             self.log_append('ERROR: Agent not configured. Contact your TallySync admin.','error')
             return
 
+        # ── Push queued Payment/Receipt vouchers into Tally FIRST ─────────────
+        # Runs before the regular Tally -> portal sync below (not after) so
+        # that any voucher created here shows up in the SAME cycle's normal
+        # voucher sync, instead of only appearing on the portal on the next
+        # scheduled run. Runs every cycle, not daily-throttled.
+        try:
+            _prog(2, 'Pushing queued vouchers…')
+            pushed, failed = push_pending_vouchers(host, srv, uid, key, log=self.log_append)
+            if pushed or failed:
+                self.log_append(f'Voucher push: {pushed} sent, {failed} failed.', 'ok' if not failed else 'warn')
+        except Exception as pve:
+            self.log_append(f'Voucher push check skipped: {pve}', 'warn')
+
         try:
             # ── 1 & 2. Masters (Ledgers + Stock) — Incremental via AlterID ────
             # Use company_id in the key — prevents same-name companies sharing a watermark
@@ -2758,18 +2801,6 @@ class TallySyncApp:
             except Exception as rne:
                 self.log_append(f'Renumber check skipped: {rne}', 'warn')
 
-            # ── Push queued Payment/Receipt vouchers into Tally ───────────────────
-            # Reverse direction of normal sync: vouchers created on the portal
-            # (voucher-new.php) waiting to be created in Tally. Runs every cycle
-            # (not daily-throttled) so a pushed voucher reaches Tally promptly.
-            try:
-                _prog(96, 'Pushing queued vouchers…')
-                pushed, failed = push_pending_vouchers(host, srv, uid, key, log=self.log_append)
-                if pushed or failed:
-                    self.log_append(f'Voucher push: {pushed} sent, {failed} failed.', 'ok' if not failed else 'warn')
-            except Exception as pve:
-                self.log_append(f'Voucher push check skipped: {pve}', 'warn')
-
             # ── Daily deleted-voucher check ──────────────────────────────────────
             # See fetch_voucher_guids_for_presence_check()'s docstring: Tally gives
             # us no direct signal for a hard-deleted voucher, so once a day we pull
@@ -2940,7 +2971,120 @@ class TallySyncApp:
             _show(f'✗ {str(e)[:60]}', ok=False)
 
 
-    # ── LOG (file only — no in-window panel) ─────────────────────────────────
+    def _diagnose_item_description(self, host, company, result_label=None):
+        """
+        Diagnostic for the "item description not fetched" issue. This pulls
+        a small batch of vouchers with items DIRECTLY from Tally (bypassing
+        the portal entirely) and inspects the raw XML for whatever
+        description-related tag Tally is actually emitting — <DESCRIPTION>,
+        <DESCRIPTION.LIST>, <DESCRIPTIONS.LIST>, or nothing at all. This
+        tells us definitively whether the problem is:
+          (a) Tally isn't sending item descriptions at all (nothing entered
+              against those items, or the "Item Description" column isn't
+              enabled for that voucher type in Tally — a Tally-side setting,
+              not a bug), or
+          (b) Tally IS sending them under a tag name the portal doesn't
+              parse yet, in which case this report shows the exact tag text
+              to fix tally_client.php's regex for.
+        Writes a full report to a local file and shows a short summary.
+        """
+        import re
+
+        def _show(msg, ok=True):
+            self.log_append(msg, 'ok' if ok else 'error')
+            if result_label:
+                color = '#0e9f6e' if ok else '#e02424'
+                self.root.after(0, lambda: result_label.config(text=msg, fg=color))
+
+        try:
+            _show('Fetching sample vouchers from Tally…', ok=True)
+            xml = fetch_all_vouchers_unfiltered(host, company=company or '', timeout=300)
+        except Exception as e:
+            _show(f'✗ Could not reach Tally: {str(e)[:80]}', ok=False)
+            return
+
+        if not xml or '<ENVELOPE' not in xml.upper():
+            _show('✗ Tally returned no usable data — is Tally open with this company?', ok=False)
+            return
+
+        # Pull out every INVENTORYENTRIES.LIST block and look for anything
+        # description-shaped inside it.
+        entry_blocks = re.findall(
+            r'<(?:ALL)?INVENTORYENTRIES\.LIST>(.*?)</(?:ALL)?INVENTORYENTRIES\.LIST>',
+            xml, re.I | re.S)
+        desc_tag_pattern = re.compile(r'<(/?)([A-Z0-9_.]*DESCRIPTION[A-Z0-9_.]*)>', re.I)
+
+        tags_found = {}       # tag name -> count of entries containing it
+        entries_with_text = 0
+        entries_checked = 0
+        sample_block = ''
+        for block in entry_blocks:
+            entries_checked += 1
+            found_here = set()
+            for m in desc_tag_pattern.finditer(block):
+                found_here.add(m.group(2).upper())
+            for t in found_here:
+                tags_found[t] = tags_found.get(t, 0) + 1
+            if found_here and not sample_block:
+                sample_block = block[:1500]
+            # Does the block have any non-empty text near a description tag?
+            for tag in found_here:
+                mm = re.search(r'<' + re.escape(tag) + r'>(.*?)</' + re.escape(tag) + r'>', block, re.I | re.S)
+                if mm and re.sub(r'<[^>]+>', '', mm.group(1)).strip():
+                    entries_with_text += 1
+                    break
+
+        lines = []
+        lines.append('=== TallySync Item Description Diagnostic ===')
+        lines.append(f'Company: {company or "(first open company)"}')
+        lines.append(f'Tally host: {host}')
+        lines.append(f'Inventory entry blocks scanned: {entries_checked}')
+        lines.append('')
+        if not entries_checked:
+            lines.append('No inventory entries found at all in this window — try a company/date')
+            lines.append('range that has Sales or Purchase vouchers with stock items on them.')
+        elif not tags_found:
+            lines.append('RESULT: Tally is NOT sending any description-shaped tag for these')
+            lines.append('items. This usually means nothing is actually typed into the "Item')
+            lines.append('Description" field against these vouchers in Tally itself (it is a')
+            lines.append('per-voucher-line field the user fills in — F12 > Invoice/Voucher')
+            lines.append('printing config in Tally usually needs "Item Description" allowed).')
+            lines.append('Check by opening one of these vouchers in Tally and confirming an')
+            lines.append('item description was actually entered.')
+        else:
+            lines.append('RESULT: Tally IS sending description-shaped tag(s):')
+            for t, cnt in sorted(tags_found.items(), key=lambda x: -x[1]):
+                lines.append(f'    <{t}>  — present in {cnt}/{entries_checked} entries')
+            lines.append('')
+            lines.append(f'Entries where that tag actually contained text: {entries_with_text}')
+            lines.append('')
+            lines.append('Send this report (and the sample block below) back for a regex fix —')
+            lines.append('tally_client.php needs to match the exact tag name shown above.')
+            lines.append('')
+            lines.append('--- Sample raw block (first match, truncated to 1500 chars) ---')
+            lines.append(sample_block)
+
+        report = '\n'.join(lines)
+        try:
+            out_path = LOG_FILE.parent / 'item_description_diagnostic.txt'
+            out_path.write_text(report, encoding='utf-8')
+        except Exception:
+            out_path = None
+
+        self.log_append('--- Item Description Diagnostic ---', 'info')
+        for l in lines[:12]:
+            self.log_append(l, 'info')
+        if out_path:
+            self.log_append(f'Full report saved to: {out_path}', 'info')
+
+        if not entries_checked:
+            _show('⚠ No inventory items found in range — see log', ok=False)
+        elif not tags_found:
+            _show('⚠ Tally sends no description tag — likely not entered in Tally. See log.', ok=False)
+        else:
+            _show(f'✓ Found <{list(tags_found.keys())[0]}> — report saved, see log', ok=True)
+
+
 
     def log_append(self, msg, tag='info'):
         """Write a log line to the rotating log file and Python logger.
