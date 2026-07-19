@@ -955,6 +955,7 @@ def push_pending_vouchers(host, srv, uid, key, log=None):
 
     _log(f'Pushing {len(pending)} queued voucher(s) into Tally…', 'info')
     result_url = voucher_push_result_url(srv)
+    debug_path = APP_DIR / 'voucher_push_debug.log'
     pushed = 0
     failed = 0
     for item in pending:
@@ -964,6 +965,18 @@ def push_pending_vouchers(host, srv, uid, key, log=None):
             continue
         try:
             tally_resp = tally_post(host, xml, timeout=60)
+            # Full record of exactly what was sent and what came back — this
+            # is what to check first for any push that behaves unexpectedly
+            # (e.g. Tally accepts the import but later flags a Credit/Debit
+            # mismatch exception, which isn't visible in the immediate
+            # CREATED/LINEERROR response at all).
+            try:
+                with open(debug_path, 'a', encoding='utf-8') as f:
+                    f.write(f'\n{"="*70}\n[{datetime.now().isoformat()}] push_id={push_id}\n')
+                    f.write(f'--- XML SENT ---\n{xml}\n')
+                    f.write(f'--- TALLY RESPONSE ---\n{tally_resp}\n')
+            except Exception:
+                pass
             rres = simple_post(result_url, {
                 'uid': uid, 'key': key, 'push_id': push_id,
                 'tally_response': tally_resp or '',
