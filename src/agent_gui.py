@@ -903,6 +903,40 @@ def renumber_vouchers_url(server_url):
     base = server_url.rsplit('/', 1)[0]
     return base + '/renumber_vouchers.php'
 
+def _attach_tooltip(widget, text):
+    """
+    Attaches a simple hover tooltip to a Tkinter widget — Tkinter has no
+    native title/alt attribute, so this shows a small borderless Toplevel
+    with the given text near the cursor on mouse-enter, and destroys it on
+    mouse-leave. Safe to call even if `text` matches what's already
+    displayed (harmless extra tooltip).
+    """
+    tip_state = {'win': None}
+
+    def _show(event):
+        if tip_state['win'] is not None:
+            return
+        win = tk.Toplevel(widget)
+        win.wm_overrideredirect(True)
+        win.wm_geometry(f'+{event.x_root + 12}+{event.y_root + 12}')
+        label = tk.Label(win, text=text, bg='#111827', fg='white',
+                          font=('Segoe UI', 9), padx=8, pady=4,
+                          justify='left', wraplength=360)
+        label.pack()
+        tip_state['win'] = win
+
+    def _hide(event=None):
+        if tip_state['win'] is not None:
+            try:
+                tip_state['win'].destroy()
+            except Exception:
+                pass
+            tip_state['win'] = None
+
+    widget.bind('<Enter>', _show)
+    widget.bind('<Leave>', _hide)
+    widget.bind('<Destroy>', _hide)
+
 def agent_backup_url(server_url):
     """Derive api/agent_backup.php from the configured ingest URL."""
     if server_url.endswith('ingest.php'):
@@ -2187,8 +2221,8 @@ class TallySyncApp:
                 # Truncate long names for display only — 'cname' itself stays intact
                 # since it's used elsewhere as a lookup key (self.co_progress[cname]).
                 display_name = cname
-                if len(display_name) > 30:
-                    base = a['name'][:30].rstrip() + '...'
+                if len(display_name) > 35:
+                    base = a['name'][:35].rstrip() + '...'
                     display_name = f'{base}  [{num}]' if num else base
                 is_open    = _co_is_open(a)
 
@@ -2208,8 +2242,13 @@ class TallySyncApp:
 
                 # Company name — grey out if not open in Tally
                 name_color = '#111827' if is_open else '#9ca3af'
-                tk.Label(inf, text=display_name, bg='white', fg=name_color,
-                         font=('Segoe UI', 10, 'bold'), anchor='w').pack(anchor='w')
+                name_label = tk.Label(inf, text=display_name, bg='white', fg=name_color,
+                         font=('Segoe UI', 10, 'bold'), anchor='w')
+                name_label.pack(anchor='w')
+                # Tooltip with the full (untruncated) name on hover — Tkinter has
+                # no native title/alt attribute, so this is a small popup window
+                # that appears near the cursor and closes on mouse-leave.
+                _attach_tooltip(name_label, cname)
 
                 # Status sub-label
                 if not is_open:
