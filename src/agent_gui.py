@@ -523,6 +523,15 @@ def fetch_ledgers_by_alterid(host, min_alterid, company=''):
         'LEDMAILINGDETAILS.LIST.MOBILEPHONE',
         'LEDMAILINGDETAILS.LIST.LANDLINEPHONE',
         'CONTACTNO','PHONENUMBER','MOBILEPHONE','LEDGERPHONE','LEDGERMOBILE','ISDELETEDMASTER',
+        # Party/GST details for Purchase/Sales — not yet confirmed against a
+        # real ledger export the way the voucher XML was, so several
+        # plausible field-name variants are fetched; parseTallyLedgers()
+        # tries each in order and keeps whichever comes back non-empty.
+        'ADDRESS.LIST', 'LEDMAILINGDETAILS.LIST.ADDRESS.LIST',
+        'STATENAME', 'LEDSTATENAME', 'LEDMAILINGDETAILS.LIST.STATENAME',
+        'COUNTRYNAME', 'LEDMAILINGDETAILS.LIST.COUNTRYNAME',
+        'PARTYGSTIN', 'GSTIN', 'GSTREGISTRATIONNUMBER',
+        'GSTREGISTRATIONTYPE', 'PARTYGSTREGISTRATIONTYPE',
     ])
     xml = (
         '<ENVELOPE><HEADER><VERSION>1</VERSION>'
@@ -566,6 +575,43 @@ def fetch_stock_by_alterid(host, min_alterid, company=''):
         '<TDL><TDLMESSAGE>'
         '<COLLECTION NAME="TSStockIncr" ISMODIFY="No">'
         '<TYPE>StockItem</TYPE>'
+        '<FILTER>TSMasterAlterFilter</FILTER>'
+        f'<FETCH>{fields}</FETCH>'
+        '</COLLECTION>'
+        '</TDLMESSAGE>'
+        '<TDLMESSAGE>'
+        f'<SYSTEM TYPE="Formulae" NAME="TSMasterAlterFilter">$AlterId &gt; {int(min_alterid)}</SYSTEM>'
+        '</TDLMESSAGE>'
+        '</TDL></DESC></BODY></ENVELOPE>'
+    )
+    return tally_post(host, xml, timeout=120)
+
+
+def fetch_batches_by_alterid(host, min_alterid, company=''):
+    """Incremental stock BATCH sync — only batches with AlterID > min_alterid.
+    NOT YET CALLED from the main sync loop (search for a call site before
+    assuming this runs automatically). This exists so the portal can show
+    every batch Tally actually has, instead of only batches that happen to
+    appear in already-synced voucher history (the previous behavior) — but
+    the exact Tally field names below (in particular CLOSINGBALANCE as the
+    batch's quantity, and BASEUNITS as its unit) are a first attempt, not
+    yet confirmed against a real "Batch" collection export the way the
+    voucher/ledger XML was."""
+    comp_var = f'<SVCURRENTCOMPANY>{escape(company)}</SVCURRENTCOMPANY>' if company else ''
+    fields = ','.join([
+        'GUID','ALTERID','NAME','PARENT','BASEUNITS','CLOSINGBALANCE','ISDELETEDMASTER',
+    ])
+    xml = (
+        '<ENVELOPE><HEADER><VERSION>1</VERSION>'
+        '<TALLYREQUEST>Export</TALLYREQUEST>'
+        '<TYPE>Collection</TYPE><ID>TSBatchIncr</ID></HEADER>'
+        '<BODY><DESC><STATICVARIABLES>'
+        '<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>'
+        f'{comp_var}'
+        '</STATICVARIABLES>'
+        '<TDL><TDLMESSAGE>'
+        '<COLLECTION NAME="TSBatchIncr" ISMODIFY="No">'
+        '<TYPE>Batch</TYPE>'
         '<FILTER>TSMasterAlterFilter</FILTER>'
         f'<FETCH>{fields}</FETCH>'
         '</COLLECTION>'
