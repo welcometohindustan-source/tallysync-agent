@@ -2911,6 +2911,32 @@ class TallySyncApp:
                                 folder = candidate
                                 self.log_append(
                                     f'Resolved Tally data folder via tally.ini: {folder}', 'dim')
+                            else:
+                                # Some installs point tally.ini's "Data=" line
+                                # DIRECTLY at a single company's own data folder
+                                # (e.g. "Data=D:\CompanyFiles") rather than at a
+                                # parent folder containing one numbered
+                                # subfolder per company. In that layout there is
+                                # no "<root>\<company number>" subfolder to find
+                                # — ini_root itself IS the company folder. Only
+                                # treat it as such if it actually contains this
+                                # company's own data files (named after its
+                                # Tally number), so a real multi-company root
+                                # with no matching subfolder still correctly
+                                # reports "not found" instead of backing up the
+                                # wrong company's data.
+                                try:
+                                    has_own_files = any(
+                                        fn.split('.')[0] == str(portal_num_s)
+                                        for fn in os.listdir(ini_root)
+                                    )
+                                except Exception:
+                                    has_own_files = False
+                                if has_own_files:
+                                    folder = ini_root
+                                    self.log_append(
+                                        f'Resolved Tally data folder via tally.ini (single-company '
+                                        f'layout — Data= points directly at the company folder): {folder}', 'dim')
                     if folder and os.path.isdir(folder):
                         _prog(97, 'Backing up Tally data…')
                         self.log_append(
