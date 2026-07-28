@@ -1127,7 +1127,7 @@ def push_pending_vouchers(host, srv, uid, key, log=None):
 _tally_ini_data_root_cache = {'value': None, 'tried': False}
 _company_folder_scan_cache = {}   # company_number(str) -> folder path or None
 
-def find_company_folder_by_scan(company_number, max_depth=5):
+def find_company_folder_by_scan(company_number, max_depth=6, time_budget_sec=90, log=None):
     """
     Last-resort fallback: locates a company's Tally data folder by scanning
     local fixed drives directly for its own data files, rather than relying
@@ -1141,25 +1141,41 @@ def find_company_folder_by_scan(company_number, max_depth=5):
     Tally names each company's own internal data files after its company
     number (e.g. "100003.900") regardless of what the containing folder is
     called, so this looks for any file whose name (before the extension)
-    is exactly the company number — the same match already used in the
-    tally.ini-root fallback above, just applied to a full drive scan
-    instead of one candidate folder.
+    is exactly the company number.
 
-    Bounded and cached (per company number, for the life of the process)
-    since scanning whole drives is inherently slower than a direct lookup —
-    this should only ever run once per company on a given PC, with the
-    result then reused every sync after that. Skips common huge/irrelevant
-    system folders to keep it from taking unreasonably long.
+    Two things keep this from being a slow brute-force crawl of the whole
+    drive:
+      - PRIORITY ORDER: folders whose name suggests they're Tally-related
+        ("tally", "data", "erp9", "backup", etc., or a bare number — Tally
+        data folders are very often literally named after the company
+        number, per the confirmed "D:\\100003" example) are explored before
+        everything else, so the real answer is usually found in the first
+        few seconds rather than after an exhaustive crawl.
+      - TIME BUDGET: gives up after time_budget_sec seconds even if
+        unfinished, rather than let one bad case hang a sync indefinitely.
+        A budget-out is NOT cached as "not found" (see caller), so the next
+        sync tries again rather than being stuck permanently.
+
+    In-memory cache is per-process only — the caller is expected to persist
+    a successful result to the agent's own config so a PC restart doesn't
+    force a full rescan every time (this function has no knowledge of the
+    config file itself).
     """
     key = str(company_number)
     if key in _company_folder_scan_cache:
         return _company_folder_scan_cache[key]
 
+    def _log(msg):
+        if log:
+            try: log(msg)
+            except Exception: pass
+
     skip_names = {
         'windows', 'program files', 'program files (x86)', 'programdata',
         '$recycle.bin', 'system volume information', 'recovery',
-        'appdata', 'node_modules', '.git', 'windowsapps',
+        'appdata', 'node_modules', '.git', 'windowsapps', 'onedrive',
     }
+    priority_hints = ('tally', 'data', 'erp9', 'prime', 'backup', 'accounts', 'account')
 
     def _is_fixed_drive(letter):
         try:
@@ -1169,16 +1185,32 @@ def find_company_folder_by_scan(company_number, max_depth=5):
         except Exception:
             return True  # if we can't tell, don't skip it — just slower, not wrong
 
+    def _priority(name):
+        n = name.lower()
+        if n == key:
+            return 0  # a folder literally named after the company number — best bet
+        if any(h in n for h in priority_hints):
+            return 1
+        if n.isdigit():
+            return 2  # other numbered folders (sibling companies) — data root is likely nearby
+        return 3
+
+    start = time.time()
     found = None
-    for letter in 'CDEFGHIJ':
-        if found:
+    timed_out = False
+    for letter in 'DCEFGHIJ':  # D before C — data drives are more often non-system drives
+        if found or timed_out:
             break
         root = f'{letter}:\\'
         if not os.path.isdir(root) or not _is_fixed_drive(letter):
             continue
+        _log(f'  Scanning {root} for company #{key}…')
         stack = [(root, 0)]
         while stack:
-            cur, depth = stack.pop()
+            if time.time() - start > time_budget_sec:
+                timed_out = True
+                break
+            cur, depth = stack.pop(0)   # shallowest-first within each priority tier
             try:
                 entries = list(os.scandir(cur))
             except Exception:
@@ -1195,14 +1227,31 @@ def find_company_folder_by_scan(company_number, max_depth=5):
             if found:
                 break
             if depth < max_depth:
+                subdirs = []
                 for entry in entries:
                     try:
                         if entry.is_dir(follow_symlinks=False) and entry.name.lower() not in skip_names:
-                            stack.append((entry.path, depth + 1))
+                            subdirs.append(entry)
                     except Exception:
                         continue
+                subdirs.sort(key=lambda e: _priority(e.name))
+                for entry in subdirs:
+                    stack.append((entry.path, depth + 1))
+        if found:
+            break
 
-    _company_folder_scan_cache[key] = found
+    elapsed = time.time() - start
+    if found:
+        _log(f'  Found via drive scan in {elapsed:.1f}s: {found}')
+    elif timed_out:
+        _log(f'  Drive scan gave up after {time_budget_sec}s without finding it — will try again next sync.')
+    else:
+        _log(f'  Drive scan finished ({elapsed:.1f}s) — company #{key} not found on any local drive.')
+
+    if not timed_out:
+        # Only cache a definitive result (found, or a completed scan that
+        # found nothing) — a budget-out should retry next time, not stick.
+        _company_folder_scan_cache[key] = found
     return found
 
 def find_tally_ini_data_root():
@@ -3061,8 +3110,25 @@ class TallySyncApp:
                     if self.cfg.has_option('agent', backup_key) else ''
                 today_bk = datetime.now().strftime('%Y%m%d')
                 if last_backup_date != today_bk:
-                    co_info = tally_by_num_s.get(portal_num_s) if portal_num_s else None
-                    folder  = (co_info or {}).get('path', '')
+                    folder = ''
+                    folder_key = f'data_folder__{portal_num_s}' if portal_num_s else ''
+                    # Check a previously-resolved path FIRST, persisted in the
+                    # agent's own config — this is what makes every sync after
+                    # the first one instant instead of re-running the whole
+                    # DATAPATH -> tally.ini -> drive-scan chain (the drive scan
+                    # in particular can take real time) on every single sync,
+                    # and survives PC/agent restarts, unlike the in-process
+                    # caches inside find_company_folder_by_scan() itself.
+                    if folder_key and self.cfg.has_option('agent', folder_key):
+                        cached_folder = self.cfg.get('agent', folder_key, fallback='')
+                        if cached_folder and os.path.isdir(cached_folder):
+                            folder = cached_folder
+                    resolved_fresh = False
+                    if not folder:
+                        co_info = tally_by_num_s.get(portal_num_s) if portal_num_s else None
+                        folder  = (co_info or {}).get('path', '')
+                        if folder and os.path.isdir(folder):
+                            resolved_fresh = True
                     if not (folder and os.path.isdir(folder)) and portal_num_s:
                         # Tally's own reported path didn't resolve — fall back to
                         # the installed Tally's own tally.ini "Data=" line.
@@ -3071,6 +3137,7 @@ class TallySyncApp:
                             candidate = os.path.join(ini_root, str(portal_num_s))
                             if os.path.isdir(candidate):
                                 folder = candidate
+                                resolved_fresh = True
                                 self.log_append(
                                     f'Resolved Tally data folder via tally.ini: {folder}', 'dim')
                             else:
@@ -3096,6 +3163,7 @@ class TallySyncApp:
                                     has_own_files = False
                                 if has_own_files:
                                     folder = ini_root
+                                    resolved_fresh = True
                                     self.log_append(
                                         f'Resolved Tally data folder via tally.ini (single-company '
                                         f'layout — Data= points directly at the company folder): {folder}', 'dim')
@@ -3109,12 +3177,17 @@ class TallySyncApp:
                             # drives directly for this company's own data files.
                             self.log_append(
                                 f'Searching local drives for company #{portal_num_s}\'s data folder '
-                                f'(one-time, cached after this)…', 'dim')
-                            scanned = find_company_folder_by_scan(portal_num_s)
+                                f'(one-time — saved for future syncs once found)…', 'dim')
+                            scanned = find_company_folder_by_scan(portal_num_s, log=self.log_append)
                             if scanned:
                                 folder = scanned
+                                resolved_fresh = True
                                 self.log_append(
                                     f'Resolved Tally data folder via drive scan: {folder}', 'dim')
+                    if resolved_fresh and folder_key and folder and os.path.isdir(folder):
+                        if not self.cfg.has_section('agent'): self.cfg.add_section('agent')
+                        self.cfg.set('agent', folder_key, folder)
+                        save_cfg(self.cfg)
                     if folder and os.path.isdir(folder):
                         _prog(97, 'Backing up Tally data…')
                         self.log_append(
