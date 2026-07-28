@@ -1215,6 +1215,22 @@ def find_company_folder_by_scan(company_number, max_depth=6, time_budget_sec=90,
                 entries = list(os.scandir(cur))
             except Exception:
                 continue
+            # Check for a FOLDER literally named after the company number
+            # first — this is the actual confirmed pattern (a competing
+            # product's screenshot showed a company's data sitting directly
+            # in "D:\100003", not inside a folder containing files named
+            # that way). A file-basename match (checked second, below) is
+            # still kept as a fallback for installs using a shared root
+            # folder full of "100003.900"-style files instead.
+            for entry in entries:
+                try:
+                    if entry.is_dir(follow_symlinks=False) and entry.name == key:
+                        found = entry.path
+                        break
+                except Exception:
+                    continue
+            if found:
+                break
             for entry in entries:
                 try:
                     if entry.is_file(follow_symlinks=False):
