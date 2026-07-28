@@ -587,7 +587,44 @@ def fetch_stock_by_alterid(host, min_alterid, company=''):
     return tally_post(host, xml, timeout=120)
 
 
-def fetch_batches_by_alterid(host, min_alterid, company=''):
+def fetch_stock_valuation_for_period(host, from_date, to_date, company=''):
+    """Stock valuation scoped to a specific date range — for the portal's
+    Income & Expense (P&L) Opening/Closing Stock figures, which need
+    Tally's OWN date-scoped valuation, not the master-level OPENINGVALUE/
+    CLOSINGVALUE fetch_stock_by_alterid() gets (that's a one-time "books
+    began" figure and a live-today snapshot respectively — neither is
+    aware of whatever period a P&L report covers).
+
+    Tally's Collection export honors SVFROMDATE/SVTODATE in STATICVARIABLES
+    to scope OPENINGVALUE/CLOSINGVALUE calculations to that window, the
+    same way changing the Period (Alt+F2) in the Tally UI does for its own
+    reports — this is a well-established, stable part of Tally's XML
+    export API, not a guess the way some other field names in this file
+    are flagged as. from_date/to_date should be 'YYYYMMDD' strings.
+
+    Returns per-item values; the caller sums them into portal-side totals
+    (income-expense.php currently expects one number each for opening and
+    closing stock, not a per-item breakdown)."""
+    comp_var = f'<SVCURRENTCOMPANY>{escape(company)}</SVCURRENTCOMPANY>' if company else ''
+    fields = ','.join(['NAME', 'OPENINGVALUE', 'CLOSINGVALUE'])
+    xml = (
+        '<ENVELOPE><HEADER><VERSION>1</VERSION>'
+        '<TALLYREQUEST>Export</TALLYREQUEST>'
+        '<TYPE>Collection</TYPE><ID>TSStockValuation</ID></HEADER>'
+        '<BODY><DESC><STATICVARIABLES>'
+        '<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>'
+        f'<SVFROMDATE>{from_date}</SVFROMDATE><SVTODATE>{to_date}</SVTODATE>'
+        f'{comp_var}'
+        '</STATICVARIABLES>'
+        '<TDL><TDLMESSAGE>'
+        '<COLLECTION NAME="TSStockValuation" ISMODIFY="No">'
+        '<TYPE>StockItem</TYPE>'
+        f'<FETCH>{fields}</FETCH>'
+        '</COLLECTION>'
+        '</TDLMESSAGE>'
+        '</TDL></DESC></BODY></ENVELOPE>'
+    )
+    return tally_post(host, xml, timeout=120)
     """Incremental stock BATCH sync — only batches with AlterID > min_alterid.
     NOT YET CALLED from the main sync loop (search for a call site before
     assuming this runs automatically). This exists so the portal can show
@@ -1088,6 +1125,85 @@ def push_pending_vouchers(host, srv, uid, key, log=None):
     return (pushed, failed)
 
 _tally_ini_data_root_cache = {'value': None, 'tried': False}
+_company_folder_scan_cache = {}   # company_number(str) -> folder path or None
+
+def find_company_folder_by_scan(company_number, max_depth=5):
+    """
+    Last-resort fallback: locates a company's Tally data folder by scanning
+    local fixed drives directly for its own data files, rather than relying
+    on Tally's XML API (confirmed on at least one real TallyPrime Silver
+    install to simply not return DATAPATH/CMPDATAPATH on the Company
+    collection at all — not a per-company quirk, the fields are just absent)
+    or the shared tally.ini "Data=" root (no help when a company's folder
+    is a completely separate, unrelated location — e.g. "D:\\100003" instead
+    of a subfolder of the usual Data root).
+
+    Tally names each company's own internal data files after its company
+    number (e.g. "100003.900") regardless of what the containing folder is
+    called, so this looks for any file whose name (before the extension)
+    is exactly the company number — the same match already used in the
+    tally.ini-root fallback above, just applied to a full drive scan
+    instead of one candidate folder.
+
+    Bounded and cached (per company number, for the life of the process)
+    since scanning whole drives is inherently slower than a direct lookup —
+    this should only ever run once per company on a given PC, with the
+    result then reused every sync after that. Skips common huge/irrelevant
+    system folders to keep it from taking unreasonably long.
+    """
+    key = str(company_number)
+    if key in _company_folder_scan_cache:
+        return _company_folder_scan_cache[key]
+
+    skip_names = {
+        'windows', 'program files', 'program files (x86)', 'programdata',
+        '$recycle.bin', 'system volume information', 'recovery',
+        'appdata', 'node_modules', '.git', 'windowsapps',
+    }
+
+    def _is_fixed_drive(letter):
+        try:
+            import ctypes
+            DRIVE_FIXED = 3
+            return ctypes.windll.kernel32.GetDriveTypeW(f'{letter}:\\') == DRIVE_FIXED
+        except Exception:
+            return True  # if we can't tell, don't skip it — just slower, not wrong
+
+    found = None
+    for letter in 'CDEFGHIJ':
+        if found:
+            break
+        root = f'{letter}:\\'
+        if not os.path.isdir(root) or not _is_fixed_drive(letter):
+            continue
+        stack = [(root, 0)]
+        while stack:
+            cur, depth = stack.pop()
+            try:
+                entries = list(os.scandir(cur))
+            except Exception:
+                continue
+            for entry in entries:
+                try:
+                    if entry.is_file(follow_symlinks=False):
+                        base = entry.name.split('.')[0]
+                        if base == key:
+                            found = cur
+                            break
+                except Exception:
+                    continue
+            if found:
+                break
+            if depth < max_depth:
+                for entry in entries:
+                    try:
+                        if entry.is_dir(follow_symlinks=False) and entry.name.lower() not in skip_names:
+                            stack.append((entry.path, depth + 1))
+                    except Exception:
+                        continue
+
+    _company_folder_scan_cache[key] = found
+    return found
 
 def find_tally_ini_data_root():
     """
@@ -2983,6 +3099,22 @@ class TallySyncApp:
                                     self.log_append(
                                         f'Resolved Tally data folder via tally.ini (single-company '
                                         f'layout — Data= points directly at the company folder): {folder}', 'dim')
+                        if not (folder and os.path.isdir(folder)):
+                            # Both tally.ini-based approaches assume the company's
+                            # folder relates somehow to the shared Data= root —
+                            # no help when it's a totally separate, unrelated
+                            # location (confirmed on at least one install: e.g.
+                            # "D:\100003" alongside an otherwise normal Data root
+                            # for the other companies). Last resort: scan local
+                            # drives directly for this company's own data files.
+                            self.log_append(
+                                f'Searching local drives for company #{portal_num_s}\'s data folder '
+                                f'(one-time, cached after this)…', 'dim')
+                            scanned = find_company_folder_by_scan(portal_num_s)
+                            if scanned:
+                                folder = scanned
+                                self.log_append(
+                                    f'Resolved Tally data folder via drive scan: {folder}', 'dim')
                     if folder and os.path.isdir(folder):
                         _prog(97, 'Backing up Tally data…')
                         self.log_append(
