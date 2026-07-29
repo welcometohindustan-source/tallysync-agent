@@ -3204,111 +3204,116 @@ class TallySyncApp:
             except Exception as pce:
                 self.log_append(f'Deleted-voucher check skipped: {pce}', 'warn')
 
-            # ── Daily Tally data folder backup ──────────────────────────────────
-            # Zips the on-disk Tally company folder (identified by Tally Number,
-            # not name, so same-named split-year companies never get mixed up)
-            # and uploads it to the portal once per day.
+            # ── Tally data folder resolution (every sync) + backup (daily) ──────
+            # Resolving WHERE the company's data folder is happens on every
+            # sync, not just once a day — this is also what the GUI's data
+            # path line reads, so it needs to stay current with wherever
+            # Tally actually has the company open right now, not just
+            # whenever the once-daily backup last happened to run. Only the
+            # actual zip+upload is still gated to once per day (no reason to
+            # re-upload the same data repeatedly).
             try:
+                folder = ''
+                folder_key = f'data_folder__{portal_num_s}' if portal_num_s else ''
+                # Check a previously-resolved path FIRST, persisted in the
+                # agent's own config — this is what makes every sync after
+                # the first one instant instead of re-running the whole
+                # DATAPATH -> tally.ini -> drive-scan chain (the drive scan
+                # in particular can take real time) on every single sync,
+                # and survives PC/agent restarts, unlike the in-process
+                # caches inside find_company_folder_by_scan() itself.
+                #
+                # Existing is not the same as CURRENT: if someone copies
+                # the company folder elsewhere and reopens Tally from the
+                # new location, the old folder doesn't vanish — a plain
+                # "does this path still exist" check would keep trusting
+                # it forever. Confirm it's still locked (Tally has a file
+                # in it open right now) before trusting the cache; if not,
+                # fall through to full re-discovery below, which — via
+                # find_company_folder_by_scan()'s own multi-candidate
+                # handling — will find wherever the company actually
+                # opened from now (including a case where the OLD folder
+                # is still sitting there unlocked and a NEW one shows up
+                # locked instead) and refresh the cache to match.
+                if folder_key and self.cfg.has_option('agent', folder_key):
+                    cached_folder = self.cfg.get('agent', folder_key, fallback='')
+                    if cached_folder and os.path.isdir(cached_folder) and is_tally_folder_locked(cached_folder):
+                        folder = cached_folder
+                    elif cached_folder and os.path.isdir(cached_folder):
+                        self.log_append(
+                            f'Cached data folder for #{portal_num_s} no longer looks active '
+                            f'({cached_folder}) — re-checking…', 'dim')
+                resolved_fresh = False
+                if not folder:
+                    co_info = tally_by_num_s.get(portal_num_s) if portal_num_s else None
+                    folder  = (co_info or {}).get('path', '')
+                    if folder and os.path.isdir(folder):
+                        resolved_fresh = True
+                if not (folder and os.path.isdir(folder)) and portal_num_s:
+                    # Tally's own reported path didn't resolve — fall back to
+                    # the installed Tally's own tally.ini "Data=" line.
+                    ini_root = find_tally_ini_data_root()
+                    if ini_root:
+                        candidate = os.path.join(ini_root, str(portal_num_s))
+                        if os.path.isdir(candidate):
+                            folder = candidate
+                            resolved_fresh = True
+                            self.log_append(
+                                f'Resolved Tally data folder via tally.ini: {folder}', 'dim')
+                        else:
+                            # Some installs point tally.ini's "Data=" line
+                            # DIRECTLY at a single company's own data folder
+                            # (e.g. "Data=D:\CompanyFiles") rather than at a
+                            # parent folder containing one numbered
+                            # subfolder per company. In that layout there is
+                            # no "<root>\<company number>" subfolder to find
+                            # — ini_root itself IS the company folder. Only
+                            # treat it as such if it actually contains this
+                            # company's own data files (named after its
+                            # Tally number), so a real multi-company root
+                            # with no matching subfolder still correctly
+                            # reports "not found" instead of backing up the
+                            # wrong company's data.
+                            try:
+                                has_own_files = any(
+                                    fn.split('.')[0] == str(portal_num_s)
+                                    for fn in os.listdir(ini_root)
+                                )
+                            except Exception:
+                                has_own_files = False
+                            if has_own_files:
+                                folder = ini_root
+                                resolved_fresh = True
+                                self.log_append(
+                                    f'Resolved Tally data folder via tally.ini (single-company '
+                                    f'layout — Data= points directly at the company folder): {folder}', 'dim')
+                    if not (folder and os.path.isdir(folder)):
+                        # Both tally.ini-based approaches assume the company's
+                        # folder relates somehow to the shared Data= root —
+                        # no help when it's a totally separate, unrelated
+                        # location (confirmed on at least one install: e.g.
+                        # "D:\100003" alongside an otherwise normal Data root
+                        # for the other companies). Last resort: scan local
+                        # drives directly for this company's own data files.
+                        self.log_append(
+                            f'Searching local drives for company #{portal_num_s}\'s data folder '
+                            f'(one-time — saved for future syncs once found)…', 'dim')
+                        scanned = find_company_folder_by_scan(portal_num_s, log=self.log_append)
+                        if scanned:
+                            folder = scanned
+                            resolved_fresh = True
+                            self.log_append(
+                                f'Resolved Tally data folder via drive scan: {folder}', 'dim')
+                if resolved_fresh and folder_key and folder and os.path.isdir(folder):
+                    if not self.cfg.has_section('agent'): self.cfg.add_section('agent')
+                    self.cfg.set('agent', folder_key, folder)
+                    save_cfg(self.cfg)
+
                 backup_key = f'last_pc_backup_date__id{uid}' if uid else 'last_pc_backup_date'
                 last_backup_date = self.cfg.get('agent', backup_key, fallback='') \
                     if self.cfg.has_option('agent', backup_key) else ''
                 today_bk = datetime.now().strftime('%Y%m%d')
                 if last_backup_date != today_bk:
-                    folder = ''
-                    folder_key = f'data_folder__{portal_num_s}' if portal_num_s else ''
-                    # Check a previously-resolved path FIRST, persisted in the
-                    # agent's own config — this is what makes every sync after
-                    # the first one instant instead of re-running the whole
-                    # DATAPATH -> tally.ini -> drive-scan chain (the drive scan
-                    # in particular can take real time) on every single sync,
-                    # and survives PC/agent restarts, unlike the in-process
-                    # caches inside find_company_folder_by_scan() itself.
-                    #
-                    # Existing is not the same as CURRENT: if someone copies
-                    # the company folder elsewhere and reopens Tally from the
-                    # new location, the old folder doesn't vanish — a plain
-                    # "does this path still exist" check would keep trusting
-                    # it forever. Confirm it's still locked (Tally has a file
-                    # in it open right now) before trusting the cache; if not,
-                    # fall through to full re-discovery below, which — via
-                    # find_company_folder_by_scan()'s own multi-candidate
-                    # handling — will find wherever the company actually
-                    # opened from now (including a case where the OLD folder
-                    # is still sitting there unlocked and a NEW one shows up
-                    # locked instead) and refresh the cache to match.
-                    if folder_key and self.cfg.has_option('agent', folder_key):
-                        cached_folder = self.cfg.get('agent', folder_key, fallback='')
-                        if cached_folder and os.path.isdir(cached_folder) and is_tally_folder_locked(cached_folder):
-                            folder = cached_folder
-                        elif cached_folder and os.path.isdir(cached_folder):
-                            self.log_append(
-                                f'Cached data folder for #{portal_num_s} no longer looks active '
-                                f'({cached_folder}) — re-checking…', 'dim')
-                    resolved_fresh = False
-                    if not folder:
-                        co_info = tally_by_num_s.get(portal_num_s) if portal_num_s else None
-                        folder  = (co_info or {}).get('path', '')
-                        if folder and os.path.isdir(folder):
-                            resolved_fresh = True
-                    if not (folder and os.path.isdir(folder)) and portal_num_s:
-                        # Tally's own reported path didn't resolve — fall back to
-                        # the installed Tally's own tally.ini "Data=" line.
-                        ini_root = find_tally_ini_data_root()
-                        if ini_root:
-                            candidate = os.path.join(ini_root, str(portal_num_s))
-                            if os.path.isdir(candidate):
-                                folder = candidate
-                                resolved_fresh = True
-                                self.log_append(
-                                    f'Resolved Tally data folder via tally.ini: {folder}', 'dim')
-                            else:
-                                # Some installs point tally.ini's "Data=" line
-                                # DIRECTLY at a single company's own data folder
-                                # (e.g. "Data=D:\CompanyFiles") rather than at a
-                                # parent folder containing one numbered
-                                # subfolder per company. In that layout there is
-                                # no "<root>\<company number>" subfolder to find
-                                # — ini_root itself IS the company folder. Only
-                                # treat it as such if it actually contains this
-                                # company's own data files (named after its
-                                # Tally number), so a real multi-company root
-                                # with no matching subfolder still correctly
-                                # reports "not found" instead of backing up the
-                                # wrong company's data.
-                                try:
-                                    has_own_files = any(
-                                        fn.split('.')[0] == str(portal_num_s)
-                                        for fn in os.listdir(ini_root)
-                                    )
-                                except Exception:
-                                    has_own_files = False
-                                if has_own_files:
-                                    folder = ini_root
-                                    resolved_fresh = True
-                                    self.log_append(
-                                        f'Resolved Tally data folder via tally.ini (single-company '
-                                        f'layout — Data= points directly at the company folder): {folder}', 'dim')
-                        if not (folder and os.path.isdir(folder)):
-                            # Both tally.ini-based approaches assume the company's
-                            # folder relates somehow to the shared Data= root —
-                            # no help when it's a totally separate, unrelated
-                            # location (confirmed on at least one install: e.g.
-                            # "D:\100003" alongside an otherwise normal Data root
-                            # for the other companies). Last resort: scan local
-                            # drives directly for this company's own data files.
-                            self.log_append(
-                                f'Searching local drives for company #{portal_num_s}\'s data folder '
-                                f'(one-time — saved for future syncs once found)…', 'dim')
-                            scanned = find_company_folder_by_scan(portal_num_s, log=self.log_append)
-                            if scanned:
-                                folder = scanned
-                                resolved_fresh = True
-                                self.log_append(
-                                    f'Resolved Tally data folder via drive scan: {folder}', 'dim')
-                    if resolved_fresh and folder_key and folder and os.path.isdir(folder):
-                        if not self.cfg.has_section('agent'): self.cfg.add_section('agent')
-                        self.cfg.set('agent', folder_key, folder)
-                        save_cfg(self.cfg)
                     if folder and os.path.isdir(folder):
                         _prog(97, 'Backing up Tally data…')
                         self.log_append(
