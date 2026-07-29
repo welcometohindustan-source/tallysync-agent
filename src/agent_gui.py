@@ -1127,6 +1127,34 @@ def push_pending_vouchers(host, srv, uid, key, log=None):
 _tally_ini_data_root_cache = {'value': None, 'tried': False}
 _company_folder_scan_cache = {}   # company_number(str) -> folder path or None
 
+def is_tally_folder_locked(folder):
+    """
+    Best-effort check for whether Tally currently has a file in this folder
+    open — used both to disambiguate multiple candidate folders (see
+    find_company_folder_by_scan) and, just as importantly, to tell whether
+    a PREVIOUSLY-resolved and cached folder is still the one actually in
+    use. A company's data folder existing on disk is not the same as it
+    being the CURRENT one — e.g. someone copies the folder elsewhere and
+    opens the copy instead, or copies it as a manual backup and leaves the
+    original in place; the original still exists and would otherwise be
+    trusted forever by a plain "does this path still exist" cache check.
+
+    Not conclusive on its own (Tally may not lock every file, or this PC's
+    Tally version may not lock at all) — one signal, not a sole decider.
+    """
+    try:
+        for entry in list(os.scandir(folder))[:15]:
+            if not entry.is_file(follow_symlinks=False):
+                continue
+            try:
+                f = open(entry.path, 'r+b')
+                f.close()
+            except (PermissionError, OSError):
+                return True
+    except Exception:
+        pass
+    return False
+
 def find_company_folder_by_scan(company_number, max_depth=6, time_budget_sec=90, log=None):
     """
     Last-resort fallback: locates a company's Tally data folder by scanning
@@ -1155,6 +1183,24 @@ def find_company_folder_by_scan(company_number, max_depth=6, time_budget_sec=90,
         unfinished, rather than let one bad case hang a sync indefinitely.
         A budget-out is NOT cached as "not found" (see caller), so the next
         sync tries again rather than being stuck permanently.
+
+    MULTIPLE MATCHES: doesn't just take the first hit and stop — a user can
+    easily have a manually-copied backup of the company folder sitting on
+    another drive with the same name. Every drive is checked (stopping only
+    within a drive once that drive's own match is found, so one duplicate
+    on another drive doesn't cost a full second exhaustive crawl), and if
+    more than one candidate turns up, the LIVE one is chosen by:
+      1. Whether Tally currently has a file in it open/locked — a strong
+         sign this is the folder actually in use right now, since a stale
+         copy sitting idle on another drive won't be held open by anything.
+      2. If that's inconclusive (locking isn't guaranteed to be detectable
+         on every Tally version/file), whichever candidate has the most
+         recently modified file — an idle copy's timestamps freeze at
+         whenever it was copied, while the live one keeps changing as
+         vouchers are entered.
+    Every candidate found, and which one was picked and why, gets logged —
+    if this ever picks wrong, that's diagnosable from the log rather than
+    a silent mystery.
 
     In-memory cache is per-process only — the caller is expected to persist
     a successful result to the agent's own config so a PC restart doesn't
@@ -1195,16 +1241,30 @@ def find_company_folder_by_scan(company_number, max_depth=6, time_budget_sec=90,
             return 2  # other numbered folders (sibling companies) — data root is likely nearby
         return 3
 
+    def _most_recent_mtime(folder):
+        latest = 0
+        try:
+            for entry in os.scandir(folder):
+                try:
+                    if entry.is_file(follow_symlinks=False):
+                        latest = max(latest, entry.stat().st_mtime)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return latest
+
     start = time.time()
-    found = None
+    candidates = []   # every matching folder found, across all drives
     timed_out = False
     for letter in 'DCEFGHIJ':  # D before C — data drives are more often non-system drives
-        if found or timed_out:
+        if timed_out:
             break
         root = f'{letter}:\\'
         if not os.path.isdir(root) or not _is_fixed_drive(letter):
             continue
         _log(f'  Scanning {root} for company #{key}…')
+        found_on_this_drive = None
         stack = [(root, 0)]
         while stack:
             if time.time() - start > time_budget_sec:
@@ -1225,23 +1285,23 @@ def find_company_folder_by_scan(company_number, max_depth=6, time_budget_sec=90,
             for entry in entries:
                 try:
                     if entry.is_dir(follow_symlinks=False) and entry.name == key:
-                        found = entry.path
+                        found_on_this_drive = entry.path
                         break
                 except Exception:
                     continue
-            if found:
-                break
-            for entry in entries:
-                try:
-                    if entry.is_file(follow_symlinks=False):
-                        base = entry.name.split('.')[0]
-                        if base == key:
-                            found = cur
-                            break
-                except Exception:
-                    continue
-            if found:
-                break
+            if not found_on_this_drive:
+                for entry in entries:
+                    try:
+                        if entry.is_file(follow_symlinks=False):
+                            base = entry.name.split('.')[0]
+                            if base == key:
+                                found_on_this_drive = cur
+                                break
+                    except Exception:
+                        continue
+            if found_on_this_drive:
+                candidates.append(found_on_this_drive)
+                break   # this drive's match is in — move on to check other drives
             if depth < max_depth:
                 subdirs = []
                 for entry in entries:
@@ -1253,8 +1313,21 @@ def find_company_folder_by_scan(company_number, max_depth=6, time_budget_sec=90,
                 subdirs.sort(key=lambda e: _priority(e.name))
                 for entry in subdirs:
                     stack.append((entry.path, depth + 1))
-        if found:
-            break
+
+    found = None
+    if len(candidates) == 1:
+        found = candidates[0]
+    elif len(candidates) > 1:
+        _log(f'  Found {len(candidates)} folders matching company #{key}: {candidates}')
+        locked = [c for c in candidates if is_tally_folder_locked(c)]
+        if len(locked) == 1:
+            found = locked[0]
+            _log(f'  Picked {found} — Tally has a file in it open right now.')
+        else:
+            pool = locked if locked else candidates
+            found = max(pool, key=_most_recent_mtime)
+            _log(f'  Picked {found} — most recently modified (lock check was '
+                 f'{"inconclusive" if locked else "not conclusive on any candidate"}).')
 
     elapsed = time.time() - start
     if found:
@@ -2442,16 +2515,22 @@ class TallySyncApp:
             for a in self.assigned:
                 cname      = a['name']
                 num        = a.get('tally_number','')
-                # Show [number] suffix whenever we have it (makes same-name companies clear)
-                if num:
-                    cname = f'{cname}  [{num}]'
                 # Truncate long names for display only — 'cname' itself stays intact
                 # since it's used elsewhere as a lookup key (self.co_progress[cname]).
                 display_name = cname
                 if len(display_name) > 35:
-                    base = a['name'][:35].rstrip() + '...'
-                    display_name = f'{base}  [{num}]' if num else base
+                    display_name = cname[:35].rstrip() + '...'
                 is_open    = _co_is_open(a)
+
+                # Resolved data folder — same value the backup step itself
+                # uses (data_folder__<number>, persisted once
+                # found; see find_company_folder_by_scan()). Shown the same
+                # way Live Keeping shows it: a muted path line under the
+                # company name. Nothing to show until the first successful
+                # backup resolves it once.
+                data_path = ''
+                if num and self.cfg.has_option('agent', f'data_folder__{num}'):
+                    data_path = self.cfg.get('agent', f'data_folder__{num}', fallback='')
 
                 # ── Separator ────────────────────────────────────────────────
                 sep = tk.Frame(self.co_frame, bg='#f3f4f6', height=1)
@@ -2475,7 +2554,16 @@ class TallySyncApp:
                 # Tooltip with the full (untruncated) name on hover — Tkinter has
                 # no native title/alt attribute, so this is a small popup window
                 # that appears near the cursor and closes on mouse-leave.
-                _attach_tooltip(name_label, cname)
+                _attach_tooltip(name_label, f'{cname}  (#{num})' if num else cname)
+
+                # Data path line
+                path_label = tk.Label(
+                    inf, text=(f'📁  {data_path}' if data_path else '📁  Data path not yet detected — resolved on next sync'),
+                    bg='white', fg=('#6b7280' if data_path else '#b0b6c0'),
+                    font=('Segoe UI', 8), anchor='w')
+                path_label.pack(anchor='w')
+                if data_path:
+                    _attach_tooltip(path_label, data_path)
 
                 # Status sub-label
                 if not is_open:
@@ -3135,10 +3223,27 @@ class TallySyncApp:
                     # in particular can take real time) on every single sync,
                     # and survives PC/agent restarts, unlike the in-process
                     # caches inside find_company_folder_by_scan() itself.
+                    #
+                    # Existing is not the same as CURRENT: if someone copies
+                    # the company folder elsewhere and reopens Tally from the
+                    # new location, the old folder doesn't vanish — a plain
+                    # "does this path still exist" check would keep trusting
+                    # it forever. Confirm it's still locked (Tally has a file
+                    # in it open right now) before trusting the cache; if not,
+                    # fall through to full re-discovery below, which — via
+                    # find_company_folder_by_scan()'s own multi-candidate
+                    # handling — will find wherever the company actually
+                    # opened from now (including a case where the OLD folder
+                    # is still sitting there unlocked and a NEW one shows up
+                    # locked instead) and refresh the cache to match.
                     if folder_key and self.cfg.has_option('agent', folder_key):
                         cached_folder = self.cfg.get('agent', folder_key, fallback='')
-                        if cached_folder and os.path.isdir(cached_folder):
+                        if cached_folder and os.path.isdir(cached_folder) and is_tally_folder_locked(cached_folder):
                             folder = cached_folder
+                        elif cached_folder and os.path.isdir(cached_folder):
+                            self.log_append(
+                                f'Cached data folder for #{portal_num_s} no longer looks active '
+                                f'({cached_folder}) — re-checking…', 'dim')
                     resolved_fresh = False
                     if not folder:
                         co_info = tally_by_num_s.get(portal_num_s) if portal_num_s else None
