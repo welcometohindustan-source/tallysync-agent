@@ -17,6 +17,12 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, messagebox
 
+# Bump this on every rebuild you hand to a customer — shown in the header
+# and logged at startup, so "is this PC actually running the new build?"
+# has a definitive visual answer instead of having to infer it from
+# behavior. e.g. '4.1', '4.2', ...
+AGENT_VERSION = '4.1'
+
 # ── Logo ──────────────────────────────────────────────────────────────────────
 # Logo is embedded at build time — place logo.png in src/ folder before building
 # GitHub Actions copies it into the exe via PyInstaller --add-data
@@ -1139,17 +1145,27 @@ def is_tally_folder_locked(folder):
     original in place; the original still exists and would otherwise be
     trusted forever by a plain "does this path still exist" cache check.
 
-    Not conclusive on its own (Tally may not lock every file, or this PC's
-    Tally version may not lock at all) — one signal, not a sole decider.
+    Uses a rename-to-itself test (os.replace(path, path)) rather than
+    opening the file for read-write — opening for write fails for all
+    sorts of reasons that have nothing to do with Tally (a read-only
+    attribute, restrictive ACLs on a freshly-copied folder, an antivirus
+    scan in progress), which produces false "still locked" positives on a
+    folder Tally isn't even touching anymore. A rename specifically
+    requires Windows to grant exclusive delete/move access, which fails
+    cleanly with a sharing violation when another process (Tally) has that
+    file open, without those unrelated false-positive triggers.
+
+    Still not conclusive on its own (Tally may not keep every file open,
+    or may release locks between actions) — one signal, not a sole
+    decider; see find_company_folder_by_scan's mtime fallback.
     """
     try:
         for entry in list(os.scandir(folder))[:15]:
             if not entry.is_file(follow_symlinks=False):
                 continue
             try:
-                f = open(entry.path, 'r+b')
-                f.close()
-            except (PermissionError, OSError):
+                os.replace(entry.path, entry.path)
+            except OSError:
                 return True
     except Exception:
         pass
@@ -1604,6 +1620,7 @@ class TallySyncApp:
         self._settings_win = None
         self._tally_connected = False   # tracks last-known Tally reachability (for UI + auto-refresh)
         self._build_ui()
+        self.log_append(f'BizView Pro Sync Agent v{AGENT_VERSION} started.', 'dim')
         self.root.after(500, self._auto_connect)
         # Start the 30s auto-refresh loop unconditionally — this is what lets the
         # agent pick up Tally companies automatically once TallyPrime is opened,
@@ -1734,7 +1751,7 @@ class TallySyncApp:
                      relief='flat').pack(side='left', padx=(12, 8), pady=7)
         tk.Label(hdr, text='BizView Pro', bg=BLUE, fg=WHITE,
                  font=('Segoe UI', 16, 'bold')).pack(side='left', pady=14)
-        tk.Label(hdr, text='Agent v4.0', bg=BLUE, fg='#b3d0ff',
+        tk.Label(hdr, text=f'Agent v{AGENT_VERSION}', bg=BLUE, fg='#b3d0ff',
                  font=('Segoe UI', 10)).pack(side='right', padx=18)
 
         # ── Status bar (white strip below blue header) ────────────────────────
