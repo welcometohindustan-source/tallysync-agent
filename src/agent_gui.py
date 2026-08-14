@@ -1443,7 +1443,31 @@ def find_tally_ini_data_root():
         pass
     return None
 
-def zip_company_folder(folder_path, tally_number):
+def folder_fingerprint(folder_path):
+    """Cheap fingerprint of a folder's contents (total size + newest mtime,
+    both as integers) without reading file contents. Used to skip
+    re-zipping/re-uploading a company's backup when nothing has changed
+    since the last successful backup — the common case for OLD/closed
+    split-year Tally companies (e.g. "S.S. Electricals (18-25)") that
+    stop changing once the business moves on to a new year, but were
+    otherwise being re-zipped and re-uploaded in full every single day."""
+    total_size = 0
+    newest_mtime = 0
+    try:
+        for root, _dirs, files in os.walk(folder_path):
+            for f in files:
+                try:
+                    st = os.stat(os.path.join(root, f))
+                    total_size += st.st_size
+                    if st.st_mtime > newest_mtime:
+                        newest_mtime = st.st_mtime
+                except Exception:
+                    pass
+    except Exception:
+        return ''
+    return f'{total_size}_{int(newest_mtime)}'
+
+
     """Zip a Tally company's data folder to a temp file. Returns the zip path, or None."""
     import tempfile, zipfile, os
     safe_num = re.sub(r'[^A-Za-z0-9]', '', str(tally_number)) or 'company'
@@ -2241,6 +2265,123 @@ class TallySyncApp:
                 self._show_open_tally_button(True)
                 self.log_append(f'Connect failed: {e}', 'error')
 
+    def _backfill_old_years(self, company):
+        """One-time, user-initiated fetch of older financial years for a
+        company that already has its current year synced.
+
+        WHY THIS EXISTS: fetch_all_vouchers_unfiltered() already sends
+        SVFROMDATE=01-Apr-1990/SVTODATE=31-Mar-2099 to try to get every
+        year in one shot. In practice (confirmed by a user manually
+        widening Tally's Period via Alt+F2 and having it work), TallyPrime
+        appears to CLAMP that override to whatever Period is currently
+        active in the Tally UI for Voucher-type collections — it can
+        narrow the active period but not widen past it. So a company
+        whose active period is just the current year silently returns
+        ~0 historical vouchers even though the wide dates were requested.
+
+        This action does NOT try to change Tally's Period programmatically
+        (that would mean injecting keystrokes into a live accounting
+        session, which risks interrupting the user's own data entry) —
+        instead it walks the user through doing it themselves (exactly
+        the action already confirmed to work), then runs the same
+        wide-range export, uploading with is_first_batch_clears=False so
+        it only adds/updates vouchers (matched by Tally GUID) — it can
+        never wipe or duplicate the current year data already on the
+        portal.
+        """
+        cid   = str(company.get('company_id', '') or '')
+        name  = company.get('name', '')
+        cnum  = company.get('tally_number', '')
+        label = f"{name} [{cnum}]" if cnum else name
+
+        proceed = messagebox.askyesno(
+            'Backfill Old Years',
+            f'For:\n  {label}\n\n'
+            f'Tally only exports the years covered by its currently active '
+            f'Period, even though this agent already asks for the widest '
+            f'possible range. To pull in OLDER years:\n\n'
+            f'  1. In TallyPrime, press Alt+F2 (Change Period) for this '
+            f'company\n'
+            f'  2. Set it to cover the FULL range you want synced '
+            f'(e.g. 1-Apr-2018 to 31-Mar-2026)\n'
+            f'  3. Press Enter to confirm the new period in Tally\n'
+            f'  4. Come back here and click Yes below\n\n'
+            f"This will NOT clear or affect the current year's data "
+            f'already on the portal — it only adds what\'s missing.\n\n'
+            f'Have you widened the Period in Tally and are ready to continue?',
+            icon='question')
+        if not proceed:
+            return
+
+        def _worker():
+            try:
+                def _gcfg(k, default=''):
+                    return self.cfg.get('agent', k).strip() if self.cfg.has_option('agent', k) else default
+                host = _gcfg('tally_host', 'http://localhost:9000')
+                srv  = _gcfg('server_url', '')
+                key  = company.get('api_key', '')
+                sec  = company.get('secret_key', '')
+                uid  = cid
+                cmp_ = _gcfg('compress', 'true').lower() == 'true'
+                enc_ = _gcfg('encrypt',  'true').lower() == 'true'
+                batch_size = int(_gcfg('voucher_batch_size', '500') or '500')
+                if not uid or not srv:
+                    self.log_append('ERROR: Agent not configured. Contact your TallySync admin.', 'error')
+                    return
+
+                self.log_append(f'Backfill: fetching all years for "{name}"…', 'info')
+                xml = fetch_all_vouchers_unfiltered(host, company=name or '', timeout=1800)
+                if '<LINEERROR>' in xml.upper():
+                    err_m = re.search(r'<LINEERROR>(.*?)</LINEERROR>', xml, re.I | re.S)
+                    self.log_append(f'Tally error: {(err_m.group(1) if err_m else xml[:200]).strip()}', 'error')
+                    return
+                vch_count = count_vouchers(xml)
+                dmin, dmax = extract_date_range(xml)
+                self.log_append(
+                    f'Backfill: {vch_count} voucher(s) found' +
+                    (f' spanning {dmin} to {dmax}' if dmin and dmax else ''), 'info')
+                if vch_count == 0:
+                    self.log_append(
+                        'No vouchers returned — double check the Period was '
+                        'actually widened and saved in Tally before retrying.', 'warn')
+                    return
+
+                # Same batching/upload as the normal sync path, but every
+                # batch is sent as a non-clearing append (is_first=0) — this
+                # is what actually keeps the already-synced current year
+                # intact; saveVouchers() on the server matches by tally_guid
+                # so anything already there is just updated, not duplicated.
+                batches = split_vouchers_xml(xml, batch_size)
+                total_fetched = total_saved = 0
+                any_error = False
+                for bi, bxml in enumerate(batches):
+                    bn = count_vouchers(bxml)
+                    bundle = build_bundle(uid, 'vouchers', bxml, meta={'from_date': '', 'to_date': ''})
+                    res = send_bundle(srv, uid, key, bundle, cmp_, enc_, sec, extra={'is_first': '0'})
+                    saved   = res.get('saved', 0) if res.get('ok') else 0
+                    fetched = res.get('fetched', bn)
+                    total_fetched += fetched
+                    total_saved   += saved
+                    label_b = f'Backfill batch {bi+1}/{len(batches)}' if len(batches) > 1 else 'Backfill'
+                    self.log_append(f'{label_b} ({bn} vouchers) — fetched:{fetched} saved:{saved}',
+                                    'ok' if res.get('ok') else 'error')
+                    if res.get('error'):
+                        self.log_append(f'  -> {res.get("error")}', 'warn')
+                        any_error = True
+
+                self.log_append(
+                    f'Backfill totals for "{name}" — fetched:{total_fetched} saved:{total_saved}',
+                    'ok' if not any_error else 'warn')
+                self.root.after(0, lambda: messagebox.showinfo(
+                    'Backfill Complete',
+                    f'Older years synced for:\n  {label}\n\n'
+                    f'You can now set the Period back to normal in Tally if you like — '
+                    f'it won\'t affect future syncs.'))
+            except Exception as e:
+                self.log_append(f'Backfill failed for "{name}": {e}', 'error')
+
+        threading.Thread(target=_worker, daemon=True).start()
+
     def _force_full_resync(self, company):
         """Clear local watermarks for this company and trigger a full resync."""
         cid  = str(company.get('company_id',''))
@@ -2493,6 +2634,19 @@ class TallySyncApp:
         """Alias for _render_companies — called after detecting Tally company open/close."""
         self._render_companies()
 
+    def _co_pause_key(self, co):
+        """Single source of truth for a company's per-company auto-sync-pause
+        config.ini key. Prefer the company_id (stable across renames) and
+        fall back to a sanitized name. Used both by the pause/resume toggle
+        (_render_companies) and by the Sync All worker — previously these
+        computed the key differently (id-based vs always-name-based with a
+        different sanitizer), so a company paused via the UI kept getting
+        auto-synced because the worker was checking a key that was never set."""
+        co_id_str = str(co.get('company_id', '') or '')
+        if co_id_str:
+            return f'co_paused__id{co_id_str}'
+        return 'co_paused__' + re.sub(r'[/\\\s]', '_', co.get('name', ''))
+
     def _render_companies(self):
         for w in self.co_frame.winfo_children():
             w.destroy()
@@ -2611,8 +2765,7 @@ class TallySyncApp:
                 btn_clr = 'primary' if is_open else 'light'
 
                 # ── Per-company pause state (stored in config.ini) ────────────
-                _co_id_str   = str(a.get('company_id',''))
-                co_pause_key = f'co_paused__id{_co_id_str}' if _co_id_str else f'co_paused__{re.sub(chr(47), "_", a["name"])}'
+                co_pause_key = self._co_pause_key(a)
                 co_is_paused = (
                     self.cfg.has_option('agent', co_pause_key) and
                     self.cfg.get('agent', co_pause_key).strip() == '1'
@@ -2649,6 +2802,10 @@ class TallySyncApp:
                         menu.add_command(
                             label='⟳  Force Full Resync (clear watermark)',
                             command=lambda: self._force_full_resync(co_))
+                        menu.add_separator()
+                        menu.add_command(
+                            label='📅  Backfill Old Years (keep current data)',
+                            command=lambda: self._backfill_old_years(co_))
                     else:
                         menu.add_command(
                             label=f'Company not open in Tally', state='disabled')
@@ -2792,7 +2949,7 @@ class TallySyncApp:
                     self.log_append('Sync All stopped before next company.', 'warn')
                     break
                 cname    = co.get('name', '')
-                pause_key = 'co_paused__' + re.sub(r'[/\\\s]', '_', cname)
+                pause_key = self._co_pause_key(co)
                 if (self.cfg.has_option('agent', pause_key) and
                         self.cfg.get('agent', pause_key).strip() == '1'):
                     self.log_append(f'⏸ "{cname}" — auto-sync paused, skipping.', 'dim')
@@ -3332,32 +3489,84 @@ class TallySyncApp:
                 today_bk = datetime.now().strftime('%Y%m%d')
                 if last_backup_date != today_bk:
                     if folder and os.path.isdir(folder):
-                        _prog(97, 'Backing up Tally data…')
-                        self.log_append(
-                            f'Backing up Tally data folder for "{company_name}" (#{portal_num_s})…', 'info')
-                        zpath = zip_company_folder(folder, portal_num_s)
-                        if zpath:
-                            zsize = os.path.getsize(zpath)
-                            self.log_append(f'Uploading backup ({zsize:,} bytes) in chunks…', 'info')
-                            def _bk_progress(cn, tot, _self=self):
-                                if cn == 1 or cn == tot or cn % 5 == 0:
-                                    _self.log_append(f'  Backup chunk {cn}/{tot} uploaded', 'dim')
-                            bres = upload_company_backup(
-                                srv, uid, key, sec, portal_num_s, zpath, company_name=company_name,
-                                progress_cb=_bk_progress)
-                            if bres.get('ok'):
-                                self.log_append(
-                                    f'Backup uploaded ✓ ({zsize:,} bytes, {bres.get("total_chunks","?")} chunks)', 'ok')
-                                if not self.cfg.has_section('agent'): self.cfg.add_section('agent')
-                                self.cfg.set('agent', backup_key, today_bk)
-                                save_cfg(self.cfg)
-                            else:
-                                self.log_append(f'Backup upload failed: {bres.get("error")} '
-                                                 f'— will retry next sync.', 'warn')
-                            try: os.remove(zpath)
-                            except Exception: pass
+                        # Skip the zip+upload entirely if nothing in the
+                        # folder has changed since the last successful
+                        # backup. This is the real fix for slow daily
+                        # backups on split/closed-year companies: once a
+                        # business moves to a new Tally year, the OLD
+                        # company's data folder stops changing forever, so
+                        # there's no reason to keep re-zipping and
+                        # re-uploading the same ~278MB every day — only the
+                        # CURRENT year's (much smaller, actually-changing)
+                        # folder needs a real daily backup.
+                        fp_key = f'last_pc_backup_fp__id{uid}' if uid else 'last_pc_backup_fp'
+                        last_fp = self.cfg.get('agent', fp_key, fallback='') \
+                            if self.cfg.has_option('agent', fp_key) else ''
+                        cur_fp = folder_fingerprint(folder)
+                        if cur_fp and cur_fp == last_fp:
+                            self.log_append(
+                                f'Backup skipped for "{company_name}" — data folder unchanged '
+                                f'since the last successful backup.', 'dim')
+                            if not self.cfg.has_section('agent'): self.cfg.add_section('agent')
+                            self.cfg.set('agent', backup_key, today_bk)
+                            save_cfg(self.cfg)
                         else:
-                            self.log_append('Backup skipped — could not zip the Tally data folder.', 'warn')
+                            self.log_append(
+                                f'Backing up Tally data folder for "{company_name}" (#{portal_num_s}) '
+                                f'in the background — sync continues without waiting for it…', 'info')
+
+                            # Zipping + uploading a large data folder can take
+                            # many minutes on a slow connection. This used to run
+                            # inline here, which meant "Sync All" sat blocked on
+                            # ONE company's backup upload before it could even
+                            # start syncing the NEXT company's vouchers. Now it
+                            # runs on its own thread so the rest of this sync
+                            # (and any other companies queued behind it) proceed
+                            # immediately; the backup finishes independently and
+                            # only updates backup_key/removes the zip once done.
+                            def _backup_worker(folder_=folder, portal_num_s_=portal_num_s,
+                                                company_name_=company_name, uid_=uid,
+                                                key_=key, sec_=sec, srv_=srv,
+                                                backup_key_=backup_key, today_bk_=today_bk,
+                                                fp_key_=fp_key, cur_fp_=cur_fp):
+                                zpath = None
+                                try:
+                                    zpath = zip_company_folder(folder_, portal_num_s_)
+                                    if not zpath:
+                                        self.log_append(
+                                            f'Backup skipped for "{company_name_}" — could not zip the '
+                                            f'Tally data folder.', 'warn')
+                                        return
+                                    zsize = os.path.getsize(zpath)
+                                    self.log_append(
+                                        f'[{company_name_}] Uploading backup ({zsize:,} bytes) in chunks…', 'info')
+                                    def _bk_progress(cn, tot, _self=self, _cn2=company_name_):
+                                        if cn == 1 or cn == tot or cn % 5 == 0:
+                                            _self.log_append(f'  [{_cn2}] Backup chunk {cn}/{tot} uploaded', 'dim')
+                                    bres = upload_company_backup(
+                                        srv_, uid_, key_, sec_, portal_num_s_, zpath,
+                                        company_name=company_name_, progress_cb=_bk_progress)
+                                    if bres.get('ok'):
+                                        self.log_append(
+                                            f'[{company_name_}] Backup uploaded ✓ ({zsize:,} bytes, '
+                                            f'{bres.get("total_chunks","?")} chunks)', 'ok')
+                                        if not self.cfg.has_section('agent'): self.cfg.add_section('agent')
+                                        self.cfg.set('agent', backup_key_, today_bk_)
+                                        if cur_fp_:
+                                            self.cfg.set('agent', fp_key_, cur_fp_)
+                                        save_cfg(self.cfg)
+                                    else:
+                                        self.log_append(
+                                            f'[{company_name_}] Backup upload failed: {bres.get("error")} '
+                                            f'— will retry next sync.', 'warn')
+                                except Exception as bke:
+                                    self.log_append(f'[{company_name_}] Backup error: {bke}', 'warn')
+                                finally:
+                                    try:
+                                        if zpath: os.remove(zpath)
+                                    except Exception: pass
+
+                            threading.Thread(target=_backup_worker, daemon=True).start()
                     else:
                         self.log_append(
                             f'Backup skipped — Tally data folder not found for #{portal_num_s}.', 'warn')
