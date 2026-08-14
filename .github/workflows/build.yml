@@ -99,10 +99,30 @@ jobs:
           # PyInstaller now builds --onedir (no --onefile) — see comment
           # in the Build step above for why. Output is a folder
           # dist\BizViewProAgent\ containing the exe + an _internal\
-          # subfolder with its dependencies; copy the whole folder, not
-          # just the exe, and the NSIS script installs it recursively.
-          New-Item -ItemType Directory -Force installer\dist\BizViewProAgent | Out-Null
-          Copy-Item dist\BizViewProAgent\* installer\dist\BizViewProAgent\ -Recurse -Force
+          # subfolder with its dependencies; the NSIS script installs it
+          # recursively from installer\dist\BizViewProAgent\.
+          #
+          # NOTE: deliberately using robocopy here, not
+          # Copy-Item -Recurse "dist\BizViewProAgent\*" ... — that wildcard+
+          # -Recurse combination is a well-known unreliable PowerShell
+          # pattern for preserving nested folder structure (it silently
+          # copied nothing here, leaving the NSIS step failing with
+          # "no files found"). robocopy has no such ambiguity.
+          New-Item -ItemType Directory -Force installer\dist | Out-Null
+          robocopy "dist\BizViewProAgent" "installer\dist\BizViewProAgent" /E /NFL /NDL /NJH
+          # robocopy exit codes 0-7 are all success/informational; 8+ is a
+          # real failure. $LASTEXITCODE must be captured immediately after.
+          $rc = $LASTEXITCODE
+          if ($rc -ge 8) {
+            Write-Host "ERROR: robocopy failed with exit code $rc"
+            exit $rc
+          }
+          $copied = Get-ChildItem "installer\dist\BizViewProAgent" -Recurse -File
+          Write-Host "Staged $($copied.Count) files into installer\dist\BizViewProAgent"
+          if ($copied.Count -eq 0) {
+            Write-Host "ERROR: no files staged — check the PyInstaller build output path"
+            exit 1
+          }
           if (Test-Path config.ini) { Copy-Item config.ini installer\config.ini }
           foreach ($logo in @("src/logo.ico","src/logo.png","src/logo_icon.png")) {
             if (Test-Path $logo) { Copy-Item $logo installer\ }
@@ -128,6 +148,15 @@ jobs:
           } elseif (-not (Test-Path "installer\BizViewProSetup.exe")) {
             Write-Host "ERROR: no installer exe found"; dir installer\; exit 1
           }
+
+      - name: Create portable (zipped onedir) download
+        shell: pwsh
+        run: |
+          # --onedir has no single "BizViewProAgent.exe" anymore (that only
+          # existed with --onefile) — the exe now lives in a folder next to
+          # its _internal\ dependencies. Zip that folder so there's still a
+          # portable "no installer" download option in the release.
+          Compress-Archive -Path "dist\BizViewProAgent\*" -DestinationPath "dist\BizViewProAgent-portable.zip" -Force
 
       - name: Create installer.zip
         shell: pwsh
@@ -169,7 +198,7 @@ jobs:
             | File | Description |
             |------|-------------|
             | `BizViewProSetup.zip` | **Recommended** — full Windows installer (double-click to install) |
-            | `BizViewProAgent.exe` | Portable EXE — run directly, no install needed |
+            | `BizViewProAgent-portable.zip` | Portable — unzip and run BizViewProAgent.exe directly, no install needed |
 
             Built from commit ${{ github.sha }} on ${{ github.ref_name }}
           prerelease: ${{ steps.channel.outputs.channel != 'latest' }}
@@ -177,7 +206,7 @@ jobs:
           fail_on_unmatched_files: false
           files: |
             installer/BizViewProSetup.zip
-            dist/BizViewProAgent.exe
+            dist/BizViewProAgent-portable.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
