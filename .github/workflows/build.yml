@@ -110,13 +110,20 @@ jobs:
           # "no files found"). robocopy has no such ambiguity.
           New-Item -ItemType Directory -Force installer\dist | Out-Null
           robocopy "dist\BizViewProAgent" "installer\dist\BizViewProAgent" /E /NFL /NDL /NJH
-          # robocopy exit codes 0-7 are all success/informational; 8+ is a
-          # real failure. $LASTEXITCODE must be captured immediately after.
+          # robocopy exit codes 0-7 are all success/informational (1 = "files
+          # copied OK", which is what happened here — 1053 files, 45MB). But
+          # PowerShell's $LASTEXITCODE is only ever set by native commands,
+          # never cleared by the cmdlets that run after it — so without an
+          # explicit reset, robocopy's leftover nonzero code becomes THIS
+          # STEP's exit code at the end of the script (GitHub Actions checks
+          # $LASTEXITCODE after the script finishes), failing a step that
+          # actually succeeded. Must reset it once we know the code is safe.
           $rc = $LASTEXITCODE
           if ($rc -ge 8) {
             Write-Host "ERROR: robocopy failed with exit code $rc"
             exit $rc
           }
+          $global:LASTEXITCODE = 0
           $copied = Get-ChildItem "installer\dist\BizViewProAgent" -Recurse -File
           Write-Host "Staged $($copied.Count) files into installer\dist\BizViewProAgent"
           if ($copied.Count -eq 0) {
