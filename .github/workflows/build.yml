@@ -54,8 +54,16 @@ jobs:
       - name: Build BizViewProAgent.exe
         shell: pwsh
         run: |
+          # Deliberately NOT using --onefile: a onefile build self-extracts
+          # to a hidden temp folder every time it runs, which is a very
+          # common Windows-Defender/heuristic-AV trigger pattern for
+          # unsigned executables and is why customers have reported the
+          # installed agent getting quarantined. --onedir (the default when
+          # --onefile is omitted) ships the exe next to its dependencies
+          # instead, with no runtime self-extraction, which meaningfully
+          # reduces false positives even without a code-signing cert.
           $pyArgs = @(
-            "--onefile", "--windowed",
+            "--windowed",
             "--name", "BizViewProAgent",
             "--hidden-import", "tkinter",
             "--hidden-import", "tkinter.ttk",
@@ -88,8 +96,13 @@ jobs:
       - name: Prepare installer staging
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force installer\dist | Out-Null
-          Copy-Item dist\BizViewProAgent.exe installer\dist\BizViewProAgent.exe
+          # PyInstaller now builds --onedir (no --onefile) — see comment
+          # in the Build step above for why. Output is a folder
+          # dist\BizViewProAgent\ containing the exe + an _internal\
+          # subfolder with its dependencies; copy the whole folder, not
+          # just the exe, and the NSIS script installs it recursively.
+          New-Item -ItemType Directory -Force installer\dist\BizViewProAgent | Out-Null
+          Copy-Item dist\BizViewProAgent\* installer\dist\BizViewProAgent\ -Recurse -Force
           if (Test-Path config.ini) { Copy-Item config.ini installer\config.ini }
           foreach ($logo in @("src/logo.ico","src/logo.png","src/logo_icon.png")) {
             if (Test-Path $logo) { Copy-Item $logo installer\ }
