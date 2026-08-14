@@ -98,8 +98,10 @@ Section "${PRODUCT_NAME}" SecMain
 
   SetOutPath "$INSTDIR"
 
-  ; Main executable
-  File "dist\${EXE_NAME}"
+  ; Main executable + its dependency folder (built --onedir, not --onefile —
+  ; see build.yml for why). File /r pulls in BizViewProAgent.exe and the
+  ; _internal\ subfolder PyInstaller 6.x generates alongside it.
+  File /r "dist\BizViewProAgent\*.*"
 
   ; Logo files — copied to installer/ by GitHub Actions build
   File /nonfatal "logo.ico"
@@ -162,6 +164,7 @@ Section "Uninstall"
     "BizViewProAgent"
 
   Delete "$INSTDIR\${EXE_NAME}"
+  RMDir /r "$INSTDIR\_internal"
   Delete "$INSTDIR\logo.ico"
   Delete "$INSTDIR\logo.png"
   Delete "$INSTDIR\logo_icon.png"
