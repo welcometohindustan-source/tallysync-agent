@@ -2422,6 +2422,51 @@ class TallySyncApp:
         else:
             self.log_append(f'No watermarks found for "{label}" — already reset.', 'info')
 
+    def _force_masters_resync(self, company):
+        """Like Force Full Resync, but ONLY clears ledger/stock watermarks —
+        vouchers are left completely untouched. Use this when a master
+        (a new/edited ledger or stock item) seems to be missing on the
+        portal, without paying the cost of re-sending every voucher month
+        again (which is what makes a full resync slow)."""
+        cid  = str(company.get('company_id',''))
+        name = company.get('name','')
+        cnum = company.get('tally_number','')
+        label = f"{name} [{cnum}]" if cnum else name
+
+        if not messagebox.askyesno(
+            'Full Masters Resync',
+            f'Clear ledger/stock watermarks for:\n\n  {label}\n\n'
+            f'This will re-send ALL ledgers and stock items to the portal on\n'
+            f'the next sync — vouchers are NOT affected and won\'t be re-sent.\n'
+            f'Use this if a ledger or stock item seems to be missing on the\n'
+            f'portal even though it exists in Tally.\n\n'
+            f'Continue?', icon='warning'):
+            return
+
+        changed = False
+        if not self.cfg.has_section('agent'):
+            self.cfg.add_section('agent')
+        for prefix in ('last_master_alterid__', 'ledger_hash__', 'stock_hash__'):
+            key_ = f'{prefix}id{cid}'
+            self.cfg.set('agent', key_, '0')
+            changed = True
+        # Separate flag from Force Full Resync's — see the matching guard in
+        # _sync_watermarks_from_server() and where it's cleared after the
+        # masters portion of a sync completes.
+        self.cfg.set('agent', f'force_masters_resync__id{cid}', '1')
+
+        if changed:
+            save_cfg(self.cfg)
+            self.log_append(
+                f'Master watermarks cleared for "{label}" — next sync will resend ALL ledgers+stock (vouchers untouched).', 'ok')
+            messagebox.showinfo(
+                'Master Watermarks Cleared',
+                f'Full masters resync scheduled for:\n  {label}\n\n'
+                f'Click Sync Now to start, or wait for auto-sync.')
+            self.root.after(100, self._render_companies)
+        else:
+            self.log_append(f'No master watermarks found for "{label}" — already reset.', 'info')
+
     def _migrate_config_keys(self):
         """
         Migrate old name-based config keys to new id-based keys.
@@ -2605,12 +2650,24 @@ class TallySyncApp:
                 except ValueError:
                     local_master = 0
             if server_master > local_master:
-                if not self.cfg.has_section('agent'):
-                    self.cfg.add_section('agent')
-                self.cfg.set('agent', mkey, str(server_master))
-                changed = True
-                self.log_append(
-                    f'"{name}": seeding master watermark from portal: {server_master}', 'info')
+                # Same "was this explicitly reset?" guard as the voucher
+                # watermark above — WITHOUT it, this block was silently
+                # undoing Force Full Resync / Full Masters Resync: the local
+                # watermark gets cleared to 0, but the very next call to this
+                # function (e.g. on Connect) saw server_master > 0 = local
+                # and re-seeded it straight back up from the server's old
+                # value, so the "full resync" never actually happened.
+                mflag_key = f'force_masters_resync__id{cid}'
+                if self.cfg.has_option('agent', mflag_key) and                    self.cfg.get('agent', mflag_key).strip() == '1':
+                    self.log_append(
+                        f'"{name}": force resync active — keeping master watermark at 0, ignoring server value {server_master}', 'info')
+                else:
+                    if not self.cfg.has_section('agent'):
+                        self.cfg.add_section('agent')
+                    self.cfg.set('agent', mkey, str(server_master))
+                    changed = True
+                    self.log_append(
+                        f'"{name}": seeding master watermark from portal: {server_master}', 'info')
             elif server_master == 0 and local_master > 0:
                 if not self.cfg.has_section('agent'):
                     self.cfg.add_section('agent')
@@ -2802,6 +2859,9 @@ class TallySyncApp:
                         menu.add_command(
                             label='⟳  Force Full Resync (clear watermark)',
                             command=lambda: self._force_full_resync(co_))
+                        menu.add_command(
+                            label='🗂  Full Masters Resync (ledgers+stock only)',
+                            command=lambda: self._force_masters_resync(co_))
                         menu.add_separator()
                         menu.add_command(
                             label='📅  Backfill Old Years (keep current data)',
@@ -3202,6 +3262,15 @@ class TallySyncApp:
                 if not self.cfg.has_section('agent'):
                     self.cfg.add_section('agent')
                 self.cfg.set('agent', full_master_key, today_str)
+                save_cfg(self.cfg)
+            # Clear the masters-only force-resync flag now that the full
+            # masters resync completed — separate from the voucher
+            # force-resync flag (cleared further down after vouchers finish),
+            # since Full Masters Resync deliberately never touches vouchers
+            # and shouldn't wait on them to release this flag.
+            masters_flag_key = f'force_masters_resync__id{uid}'
+            if self.cfg.has_option('agent', masters_flag_key):
+                self.cfg.remove_option('agent', masters_flag_key)
                 save_cfg(self.cfg)
 
             # ── 3. Vouchers ──────────────────────────────────────────────────
