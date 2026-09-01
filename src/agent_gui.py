@@ -1468,6 +1468,7 @@ def folder_fingerprint(folder_path):
     return f'{total_size}_{int(newest_mtime)}'
 
 
+def zip_company_folder(folder_path, tally_number):
     """Zip a Tally company's data folder to a temp file. Returns the zip path, or None."""
     import tempfile, zipfile, os
     safe_num = re.sub(r'[^A-Za-z0-9]', '', str(tally_number)) or 'company'
